@@ -1,2 +1,1 @@
-# New version with KML support
 gdal-bin libgdal-dev proj-bin libkml-dev

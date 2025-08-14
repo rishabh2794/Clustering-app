@@ -3,6 +3,8 @@ pandas
 numpy
 geopandas
 scikit-learn
+shapely
 folium
 openpyxl
-shapely
+fiona
+streamlit-js-eval

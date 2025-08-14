@@ -316,38 +316,122 @@ if csv_file:
         batch_size = st.slider("Batch size (next N tickets)", min_value=1, max_value=10, value=10)
 
         # Get current location (JS auto + manual fallback)
-        origin_lat = origin_lon = None
-        st.markdown("### Your Location")
-        colA, colB = st.columns(2)
-        with colA:
-            if HAVE_JS_EVAL:
-                st.caption("Attempting auto location (allow browser permission)…")
-                js = """
-                new Promise((resolve) => {
-                  if (!navigator.geolocation) { resolve(null); return; }
-                  navigator.geolocation.getCurrentPosition(
-                    (pos) => resolve([pos.coords.latitude, pos.coords.longitude]),
-                    (err) => resolve(null),
-                    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-                  );
-                })
-                """
-                coords = streamlit_js_eval(js_expressions=js, key="geo_fallback")
-                if coords and isinstance(coords, list) and len(coords) == 2:
-                    origin_lat, origin_lon = float(coords[0]), float(coords[1])
-                    st.success(f"Auto location: {origin_lat:.6f}, {origin_lon:.6f}")
-            else:
-                st.info("Install 'streamlit-js-eval' for auto geolocation, or use manual entry.")
-        with colB:
-            manual_lat = st.text_input("Manual latitude (fallback)", value="")
-            manual_lon = st.text_input("Manual longitude (fallback)", value="")
-            if manual_lat.strip() and manual_lon.strip():
-                try:
-                    origin_lat = float(manual_lat)
-                    origin_lon = float(manual_lon)
-                    st.success(f"Manual location: {origin_lat:.6f}, {origin_lon:.6f}")
-                except Exception:
-                    st.error("Invalid manual coordinates. Example: 26.8467 (lat), 80.9462 (lon)")
+        # -------------------------
+# Your Location (sticky + robust + debug)
+# -------------------------
+if "origin_lat" not in st.session_state:
+    st.session_state.origin_lat = None
+if "origin_lon" not in st.session_state:
+    st.session_state.origin_lon = None
+if "geo_debug" not in st.session_state:
+    st.session_state.geo_debug = {}
+
+st.markdown("### Your Location")
+
+colA, colB, colC = st.columns([1,1,1])
+with colA:
+    use_auto = st.button("📍 Use my current location")
+with colB:
+    refresh_auto = st.button("🔄 Refresh location")
+with colC:
+    clear_auto = st.button("❌ Clear saved location")
+
+if clear_auto:
+    st.session_state.origin_lat = None
+    st.session_state.origin_lon = None
+    st.session_state.geo_debug = {}
+
+def geo_fetch_once():
+    """
+    Calls browser geolocation and returns a dict with detailed debug:
+    {
+      ok: bool, lat: float|None, lon: float|None,
+      state: 'granted'|'prompt'|'denied'|None,
+      err_code: int|None, err_msg: str|None,
+      ua: navigator.userAgent
+    }
+    """
+    try:
+        from streamlit_js_eval import streamlit_js_eval
+    except Exception:
+        return {"ok": False, "err_msg": "streamlit-js-eval not installed"}
+
+    js = r"""
+    new Promise(async (resolve) => {
+      const out = { ok: false, lat: null, lon: null, state: null, err_code: null, err_msg: null, ua: navigator.userAgent };
+      try {
+        if (!navigator.geolocation) {
+          out.err_msg = "navigator.geolocation not available";
+          resolve(out); return;
+        }
+        // Try to read permission state (not supported on all browsers)
+        try {
+          const p = await navigator.permissions.query({ name: 'geolocation' });
+          out.state = p && p.state ? p.state : null;
+        } catch (e) { /* ignore */ }
+
+        const onSuccess = (pos) => {
+          out.ok = true;
+          out.lat = pos.coords.latitude;
+          out.lon = pos.coords.longitude;
+          resolve(out);
+        };
+        const onError = (err) => {
+          out.err_code = err && err.code ? err.code : null;
+          out.err_msg = err && err.message ? err.message : "Unknown geolocation error";
+          resolve(out);
+        };
+
+        // Use watchPosition once (more reliable on some browsers than getCurrentPosition)
+        const watchId = navigator.geolocation.watchPosition(onSuccess, onError, {
+          enableHighAccuracy: true,
+          timeout: 12000,
+          maximumAge: 0
+        });
+        // Stop watching after first callback
+        setTimeout(() => { if (watchId) navigator.geolocation.clearWatch(watchId); }, 14000);
+      } catch (e) {
+        out.err_msg = String(e);
+        resolve(out);
+      }
+    })
+    """
+    return streamlit_js_eval(js_expressions=js, key=f"geo_{int(__import__('time').time())}")
+
+if use_auto or refresh_auto:
+    result = geo_fetch_once()
+    if isinstance(result, dict):
+        st.session_state.geo_debug = result
+        if result.get("ok") and result.get("lat") and result.get("lon"):
+            st.session_state.origin_lat = float(result["lat"])
+            st.session_state.origin_lon = float(result["lon"])
+            st.success(f"Auto location: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+        else:
+            st.info("Couldn’t fetch location automatically. See Geo Debug below and use manual entry.")
+
+# Manual fallback only if no saved location
+if st.session_state.origin_lat is None or st.session_state.origin_lon is None:
+    c1, c2 = st.columns(2)
+    with c1:
+        manual_lat = st.text_input("Manual latitude (fallback)", value="")
+    with c2:
+        manual_lon = st.text_input("Manual longitude (fallback)", value="")
+    if manual_lat.strip() and manual_lon.strip():
+        try:
+            st.session_state.origin_lat = float(manual_lat)
+            st.session_state.origin_lon = float(manual_lon)
+            st.success(f"Manual location: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+        except Exception:
+            st.error("Invalid manual coordinates. Example: 26.8467 (lat), 80.9462 (lon)")
+
+# Use these below
+origin_lat = st.session_state.origin_lat
+origin_lon = st.session_state.origin_lon
+
+# Optional: show debug panel
+with st.expander("🛠 Geo Debug"):
+    st.json(st.session_state.geo_debug or {"hint": "Click 'Use my current location' to populate."})
+
 
         # Build pool from ALL filtered points
         pool = gdf_all.copy()
@@ -532,3 +616,4 @@ if csv_file:
         st.error(f"Error: {e}")
 else:
     st.info("Upload the required CSV file to proceed.")
+

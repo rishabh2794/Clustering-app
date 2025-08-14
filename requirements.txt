@@ -3,8 +3,9 @@ pandas
 numpy
 geopandas
 scikit-learn
-shapely
 folium
+shapely
 openpyxl
 fiona
-streamlit-js-eval
+requests
+streamlit-geolocation

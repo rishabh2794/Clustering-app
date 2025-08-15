@@ -9,3 +9,4 @@ openpyxl
 fiona
 requests
 streamlit-geolocation
+streamlit-folium

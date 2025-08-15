@@ -1,4 +1,5 @@
 # app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
+# with Map-Click Start & Address Search (no GPS/IP needed)
 # ----------------------------------------------------------------------------
 
 import math
@@ -25,19 +26,7 @@ from sklearn.cluster import DBSCAN
 import folium
 from folium.plugins import MarkerCluster
 from openpyxl import load_workbook
-
-# Optional geolocation helpers
-try:
-    from streamlit_geolocation import st_geolocation  # component
-    HAVE_GEO = True
-except Exception:
-    HAVE_GEO = False
-
-try:
-    from streamlit_js_eval import streamlit_js_eval       # JS fallback
-    HAVE_JS = True
-except Exception:
-    HAVE_JS = False
+from streamlit_folium import st_folium  # << for map click
 
 # ----------------- Constants -----------------
 EARTH_RADIUS_M = 6_371_000.0
@@ -54,7 +43,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
     phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
     dphi = math.radians(float(lat2) - float(lat1))
     dlmb = math.radians(float(lon2) - float(lon1))
-    a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb/2)**2
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
     return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 def google_maps_url(origin_lat, origin_lon, dest_lat, dest_lon, mode="driving", waypoints=None):
@@ -125,12 +114,17 @@ def load_wards_uploaded(file):
     except Exception:
         return None
 
-def get_ip_location():
+def geocode_query(q: str, timeout=6):
+    """Address/place geocoder (OSM Nominatim). Returns (lat, lon) or (None, None)."""
     try:
-        r = requests.get("https://ipapi.co/json/", timeout=5)
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": q, "format": "json", "limit": 1}
+        headers = {"User-Agent": "cluster-app/1.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 200:
             data = r.json()
-            return float(data["latitude"]), float(data["longitude"])
+            if data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
         pass
     return None, None
@@ -155,7 +149,7 @@ def is_url(u):
 
 # ----------------- App Setup -----------------
 st.set_page_config(layout="wide", page_title="Clustering + Batch Navigation")
-st.title("🗺️ Clustering + Batch Navigation (Skip/Mark • Image Popups • Origin optional)")
+st.title("🗺️ Clustering + Batch Navigation (Map-Click Start • Skip/Mark • Downloads)")
 
 # Session state
 for k in ["visited_ticket_ids", "skipped_ticket_ids"]:
@@ -191,7 +185,7 @@ if not csv_file:
     st.info("Upload the required CSV to proceed.")
     st.stop()
 
-# Data load + filter
+# Data load + filter (+ robust coord cleanup)
 df = pd.read_csv(csv_file)
 missing = list(REQUIRED_COLS - set(df.columns))
 if missing:
@@ -200,15 +194,28 @@ if missing:
 
 df['SUBCATEGORY_NORM'] = normalize_subcategory(df['SUBCATEGORY'])
 df = df[df['SUBCATEGORY_NORM'] == subcategory_option.lower()].copy()
-df['LATITUDE'] = pd.to_numeric(df['LATITUDE'], errors='coerce')
+
+df['LATITUDE']  = pd.to_numeric(df['LATITUDE'], errors='coerce')
 df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
+df = df[df['LATITUDE'].between(-90, 90, inclusive='both')]
+df = df[df['LONGITUDE'].between(-180, 180, inclusive='both')]
 df.dropna(subset=['LATITUDE','LONGITUDE'], inplace=True)
 
-# Clustering
-coords_rad = np.radians(df[['LATITUDE','LONGITUDE']])
+if df.empty:
+    st.warning("No valid rows for the selected subcategory after cleaning LAT/LON.")
+    st.stop()
+
+# Clustering (haversine DBSCAN)
+coords_deg = df[['LATITUDE','LONGITUDE']].to_numpy(dtype=float)
+coords_rad = np.radians(coords_deg)
 eps_rad = float(radius_m) / EARTH_RADIUS_M
 db = DBSCAN(eps=eps_rad, min_samples=int(min_samples), metric='haversine', algorithm='ball_tree')
-df['CLUSTER NUMBER'] = db.fit_predict(coords_rad)
+try:
+    labels = db.fit_predict(coords_rad)
+except ValueError as e:
+    st.error(f"Clustering failed due to invalid input: {e}")
+    st.stop()
+df['CLUSTER NUMBER'] = labels
 df['IS_CLUSTERED'] = df['CLUSTER NUMBER'] != -1
 
 # Optional GeoPandas overlay/join
@@ -232,90 +239,64 @@ if not clustered.empty:
     )
     hyperlinkify_excel(excel_filename)
 
-# ---------------- Location (robust: Browser GPS → JS → IP → Manual) ----------------
-st.subheader("Step 4: Your Location")
+# ---------------- Start Point (Map-Click + Address Search + Manual) ----------------
+st.subheader("Step 4: Set Start Point (No GPS Needed)")
 
-origin_lat, origin_lon = st.session_state.origin_lat, st.session_state.origin_lon
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    use_browser = st.button("📍 Use Browser GPS", key="btn_browser_gps")
-with c2:
-    do_refresh = st.button("🔄 Refresh", key="btn_refresh_gps")
-with c3:
-    do_clear = st.button("❌ Clear", key="btn_clear_gps")
-with c4:
-    use_ip = st.button("🌐 Use IP Location", key="btn_ip_gps")
-
-if do_clear:
-    st.session_state.origin_lat = None
-    st.session_state.origin_lon = None
-    origin_lat = origin_lon = None
-    st.info("Cleared saved location.")
-
-def try_browser_gps_once():
-    # 1) streamlit_geolocation component (if installed)
-    if HAVE_GEO:
-        st.caption("Grant location permission in your browser if prompted.")
-        loc = st_geolocation(key=f"geo_once")
-        if loc and loc.get("latitude") and loc.get("longitude"):
-            st.session_state.origin_lat = float(loc["latitude"])
-            st.session_state.origin_lon = float(loc["longitude"])
-            return True
-    # 2) JS fallback (works on HTTPS)
-    if HAVE_JS:
-        js = """
-        new Promise((resolve) => {
-          if (!navigator.geolocation) { resolve(null); return; }
-          navigator.geolocation.getCurrentPosition(
-            (pos) => resolve([pos.coords.latitude, pos.coords.longitude]),
-            () => resolve(null),
-            { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
-          );
-        })
-        """
-        coords = streamlit_js_eval(js_expressions=js, key=f"geo_js_{int(__import__('time').time())}")
-        if coords and isinstance(coords, list) and len(coords) == 2:
-            st.session_state.origin_lat = float(coords[0])
-            st.session_state.origin_lon = float(coords[1])
-            return True
-    return False
-
-if use_browser or do_refresh:
-    ok = try_browser_gps_once()
-    if ok:
-        origin_lat, origin_lon = st.session_state.origin_lat, st.session_state.origin_lon
-        st.success(f"Browser GPS: {origin_lat:.6f}, {origin_lon:.6f}")
-    else:
-        st.warning("Couldn’t get browser GPS (permission blocked or component not loaded).")
-
-if use_ip and (origin_lat is None or origin_lon is None):
-    ip_lat, ip_lon = get_ip_location()
-    if ip_lat and ip_lon:
-        st.session_state.origin_lat = ip_lat
-        st.session_state.origin_lon = ip_lon
-        origin_lat, origin_lon = ip_lat, ip_lon
-        st.success(f"IP-based location: {origin_lat:.6f}, {origin_lon:.6f}")
-    else:
-        st.warning("IP-based lookup failed. You can still use the route link (Maps will use live GPS).")
-
-# Manual fallback only if nothing saved
-if origin_lat is None or origin_lon is None:
-    m1, m2 = st.columns(2)
-    with m1:
-        man_lat = st.text_input("Manual latitude (optional)", key="txt_lat")
-    with m2:
-        man_lon = st.text_input("Manual longitude (optional)", key="txt_lon")
-    if man_lat.strip() and man_lon.strip():
+# Address search (optional)
+colA, colB = st.columns(2)
+with colA:
+    q = st.text_input("🔎 Search address / landmark (optional)", key="txt_addr_query")
+    if st.button("Search & set start", key="btn_addr_geocode"):
+        if q.strip():
+            g_lat, g_lon = geocode_query(q.strip())
+            if g_lat is not None:
+                st.session_state.origin_lat = g_lat
+                st.session_state.origin_lon = g_lon
+                st.success(f"Start set from search: {g_lat:.6f}, {g_lon:.6f}")
+                st.rerun()
+            else:
+                st.error("Could not geocode that query. Try a more specific address.")
+with colB:
+    # Manual coordinates (optional)
+    man_lat = st.text_input("Manual latitude (optional)", key="txt_lat")
+    man_lon = st.text_input("Manual longitude (optional)", key="txt_lon")
+    if st.button("Set manual start", key="btn_set_manual"):
         try:
             st.session_state.origin_lat = float(man_lat)
             st.session_state.origin_lon = float(man_lon)
-            origin_lat, origin_lon = st.session_state.origin_lat, st.session_state.origin_lon
-            st.success(f"Manual location: {origin_lat:.6f}, {origin_lon:.6f}")
+            st.success(f"Manual start set: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+            st.rerun()
         except Exception:
             st.error("Invalid coordinates. Example: 26.8467, 80.9462")
+
+# Map-click picker
+st.caption("🗺️ Or click anywhere on the mini map to set your starting point:")
+center_lat = float(df['LATITUDE'].mean())
+center_lon = float(df['LONGITUDE'].mean())
+mini = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+# Show existing start marker if set
+if st.session_state.origin_lat is not None and st.session_state.origin_lon is not None:
+    folium.Marker(
+        [st.session_state.origin_lat, st.session_state.origin_lon],
+        popup="Start here",
+        icon=folium.Icon(color="green", icon="flag")
+    ).add_to(mini)
+
+click_state = st_folium(mini, height=320, width=None, key="mini_click", returned_objects=["last_clicked"])
+if isinstance(click_state, dict):
+    clicked = click_state.get("last_clicked")
+    if clicked and "lat" in clicked and "lng" in clicked:
+        st.session_state.origin_lat = float(clicked["lat"])
+        st.session_state.origin_lon = float(clicked["lng"])
+        st.success(f"Start set from map click: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+        st.rerun()
+
+origin_lat = st.session_state.origin_lat
+origin_lon = st.session_state.origin_lon
+if origin_lat is not None and origin_lon is not None:
+    st.info(f"Using start: {origin_lat:.6f}, {origin_lon:.6f}")
 else:
-    st.info(f"Using saved location: {origin_lat:.6f}, {origin_lon:.6f}")
+    st.warning("No start set. It’s okay—your Google Maps link will still start from the phone’s current GPS.")
 
 # ---------------- Batch + Skip/Mark ----------------
 st.subheader("Step 5: Batches of 10 — View • Skip • Mark")
@@ -331,8 +312,7 @@ if pool.empty:
     st.info("No tickets remaining after filters/visited/skipped.")
     batch_df = pd.DataFrame(columns=['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE'])
 else:
-    # Build a long sequence (up to 200) using greedy NN, then show the current batch of 10 via cursor
-    # Seed from origin if available, else from centroid
+    # Seed NN: from start point; else from dataset centroid
     if origin_lat is None or origin_lon is None:
         seed_lat, seed_lon = float(pool['LATITUDE'].mean()), float(pool['LONGITUDE'].mean())
     else:
@@ -368,30 +348,30 @@ else:
 
     # Actions
     c1, c2, c3, c4 = st.columns(4)
-    first_id = str(batch_df.iloc[0]['ISSUE ID']) if len(batch_df) else None
+    first_id = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
 
     with c1:
         if st.button("✅ Mark first as Visited", key="btn_mark_first"):
             if first_id:
                 st.session_state.visited_ticket_ids.add(first_id)
-                st.experimental_rerun()
+                st.rerun()
 
     with c2:
         if st.button("⏭️ Skip first", key="btn_skip_first"):
             if first_id:
                 st.session_state.skipped_ticket_ids.add(first_id)
-                st.experimental_rerun()
+                st.rerun()
 
     with c3:
         if st.button("✅ Mark entire batch as Visited", key="btn_mark_batch"):
             for _id in batch_df['ISSUE ID'].astype(str).tolist():
                 st.session_state.visited_ticket_ids.add(_id)
-            st.experimental_rerun()
+            st.rerun()
 
     with c4:
         if st.button("➡️ Next batch", key="btn_next_batch"):
             st.session_state.batch_cursor = end if end < len(seq_df) else 0
-            st.experimental_rerun()
+            st.rerun()
 
 # ---------------- Map (+ clickable image links / thumbnails) ----------------
 st.subheader("Step 6: Map")
@@ -401,7 +381,7 @@ show_thumbs = st.checkbox("Show image thumbnails in popups (may slow the map)", 
 
 center_lat = float(df['LATITUDE'].mean())
 center_lon = float(df['LONGITUDE'].mean())
-m = folium.Map(location=[center_lat, center_lon], zoom_start=13)
+m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
 mc = MarkerCluster(name="Tickets").add_to(m)
 
 plot_df = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
@@ -409,6 +389,11 @@ plot_df = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, 
 # Color coding: visited = gray, skipped = purple, current batch = orange, first = green
 batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if not batch_df.empty else set()
 first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
+
+# Start marker if set
+if origin_lat is not None and origin_lon is not None:
+    folium.Marker([origin_lat, origin_lon], popup="Start here",
+                  icon=folium.Icon(color="green", icon="flag")).add_to(m)
 
 for _, row in plot_df.iterrows():
     rid = str(row['ISSUE ID'])

@@ -1,5 +1,4 @@
-# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
-# with Map-Click Start, Address Search, Per-Issue Camera/Upload, and ZIP Export
+# app.py — Clustering + Batch Navigation + Per-Row Upload + Camera + ZIP Export
 # ----------------------------------------------------------------------------
 
 import math
@@ -312,7 +311,7 @@ else:
     st.warning("No start set. It’s okay—your Google Maps link will still start from the phone’s current GPS.")
 
 # ---------------- Batch + Skip/Mark ----------------
-st.subheader("Step 5: Batches of 10 — View • Skip • Mark")
+st.subheader("Step 5: Batches of 10 — View • Upload • Skip • Mark")
 
 # Filter out visited/skipped from the pool
 pool = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
@@ -346,33 +345,18 @@ else:
         start, end = 0, min(10, len(seq_df))
         batch_df = seq_df.iloc[start:end].copy()
 
-    # ----- Show batch table (Before Photo as clickable link) -----
-    batch_df_display = (
-        batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']]
-        .reset_index(drop=True)
-    )
-    batch_df_display.index = batch_df_display.index + 1  # 1-based row numbers
-    batch_df_display['BEFORE PHOTO'] = batch_df_display['BEFORE PHOTO'].apply(
-        lambda x: x if is_url(str(x).strip()) else None
-    )
+    # ----- Render a table-like layout WITH per-row uploader (and camera) -----
+    st.markdown("### Current Batch (with per-row Upload/Camera)")
 
-    st.dataframe(
-        batch_df_display,
-        use_container_width=True,
-        column_config={
-            'LATITUDE': st.column_config.NumberColumn('LATITUDE', format="%.6f"),
-            'LONGITUDE': st.column_config.NumberColumn('LONGITUDE', format="%.6f"),
-            'BEFORE PHOTO': st.column_config.LinkColumn(
-                'Before Photo',
-                display_text='Open',
-                help='Opens the before image in a new tab'
-            ),
-        }
-    )
-    # -------------------------------------------------------------
-
-    # ----- Per-issue Camera + Upload (ALWAYS available; no After link shown) -----
-    st.markdown("**Upload / Click After Photo for each issue in this batch:**")
+    # Table header
+    hdr = st.columns([1, 2.2, 2.2, 2.2, 3.0, 2.8, 3.6])
+    hdr[0].markdown("**#**")
+    hdr[1].markdown("**Issue ID**")
+    hdr[2].markdown("**Ward**")
+    hdr[3].markdown("**Status**")
+    hdr[4].markdown("**Lat, Lon**")
+    hdr[5].markdown("**Before Photo**")
+    hdr[6].markdown("**Upload / Click After Photo**")
 
     def _save_img_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
         ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -394,29 +378,52 @@ else:
         }
         st.session_state.uploaded_after_photos.setdefault(issue_id, []).append(rec)
 
-    for _, row in batch_df.iterrows():
+    # Render rows
+    for idx, row in batch_df.reset_index(drop=True).iterrows():
         issue_id = str(row['ISSUE ID'])
-        ward     = row.get('WARD', '')
-        status   = row.get('STATUS', '')
+        ward     = str(row.get('WARD', ''))
+        status   = str(row.get('STATUS', ''))
+        lat      = float(row['LATITUDE'])
+        lon      = float(row['LONGITUDE'])
+        before   = str(row.get('BEFORE PHOTO', '') or '').strip()
 
-        col_info, col_cam, col_upl = st.columns([3,2,2])
-        with col_info:
-            st.caption(f"Issue **{issue_id}** — Ward {ward}, Status: {status}")
+        c = st.columns([1, 2.2, 2.2, 2.2, 3.0, 2.8, 3.6])
+        c[0].markdown(f"{idx+1}")
+        c[1].markdown(issue_id)
+        c[2].markdown(ward)
+        c[3].markdown(status)
+        c[4].markdown(f"{lat:.6f}, {lon:.6f}")
+        if is_url(before):
+            c[5].markdown(f"[Open]({before})")
+        else:
+            c[5].markdown("—")
 
-        with col_cam:
-            cam = st.camera_input(f"Take photo ({issue_id})", key=f"cam_{issue_id}")
-            if cam is not None:
-                _save_img_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
-                st.success("Captured ✅")
+        # Uploader inside the 'table cell'
+        up = c[6].file_uploader(
+            label=f"Upload After Photo for {issue_id}",
+            type=["jpg","jpeg","png"],
+            key=f"upl_tbl_{issue_id}",
+            label_visibility="collapsed",
+            accept_multiple_files=False
+        )
+        if up is not None:
+            _save_img_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
+            c[6].markdown("✅ Saved")
 
-        with col_upl:
-            up = st.file_uploader(f"Upload photo ({issue_id})", type=["jpg","jpeg","png"], key=f"upl_{issue_id}")
-            if up is not None:
-                _save_img_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
-                st.success("Uploaded ✅")
+        # Optional camera in the same cell
+        cam = c[6].camera_input(
+            label=f"Take photo ({issue_id})",
+            key=f"cam_tbl_{issue_id}",
+            label_visibility="collapsed"
+        )
+        if cam is not None:
+            _save_img_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
+            c[6].markdown("✅ Captured")
 
         if issue_id in st.session_state.uploaded_after_photos:
-            st.caption(f"Saved photos in session: {len(st.session_state.uploaded_after_photos[issue_id])} 📸")
+            cnt = len(st.session_state.uploaded_after_photos[issue_id])
+            c[6].caption(f"{cnt} saved in session")
+    # -------------------------------------------------------------------------
 
     # ---------------- ZIP Download of all uploaded photos (with manifest) ----------------
     st.divider()
@@ -515,8 +522,8 @@ mc = MarkerCluster(name="Tickets").add_to(m)
 plot_df = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
 
 # Color coding: visited = gray, skipped = purple, current batch = orange, first = green
-batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if not batch_df.empty else set()
-first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
+batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if not pool.empty and not batch_df.empty else set()
+first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if not pool.empty and not batch_df.empty else None
 
 # Start marker if set
 if origin_lat is not None and origin_lon is not None:
@@ -558,7 +565,7 @@ for _, row in plot_df.iterrows():
         if show_thumbs:
             parts.append(f"<div><img src='{before_url}' style='max-width:220px;border:1px solid #ccc;border-radius:6px;'/></div>")
 
-    # NOTE: As requested, we do NOT show or add an After Photo link anywhere.
+    # NOTE: Per your instruction, no After Photo link is shown anywhere.
 
     popup_html = "<div style='font-size:13px;line-height:1.25'>" + "<br>".join(parts) + "</div>"
     popup = folium.Popup(popup_html, max_width=280)

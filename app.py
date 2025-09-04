@@ -333,10 +333,32 @@ else:
         start, end = 0, min(10, len(seq_df))
         batch_df = seq_df.iloc[start:end].copy()
 
-    # Show batch table
-    batch_df_display = batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE']].reset_index(drop=True)
+    # ----- Show batch table (ADDED: clickable Before Photo link) -----
+    batch_df_display = (
+        batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']]
+        .reset_index(drop=True)
+    )
     batch_df_display.index = batch_df_display.index + 1  # 1-based row numbers
-    st.dataframe(batch_df_display, use_container_width=True)
+
+    # Clean non-URLs so empty cells don't show broken links
+    batch_df_display['BEFORE PHOTO'] = batch_df_display['BEFORE PHOTO'].apply(
+        lambda x: x if is_url(str(x).strip()) else None
+    )
+
+    st.dataframe(
+        batch_df_display,
+        use_container_width=True,
+        column_config={
+            'LATITUDE': st.column_config.NumberColumn('LATITUDE', format="%.6f"),
+            'LONGITUDE': st.column_config.NumberColumn('LONGITUDE', format="%.6f"),
+            'BEFORE PHOTO': st.column_config.LinkColumn(
+                'Before Photo',
+                display_text='Open',
+                help='Opens the before image in a new tab'
+            ),
+        }
+    )
+    # ---------------------------------------------------------------
 
     # Google Maps link for this batch (origin optional)
     if not batch_df.empty:

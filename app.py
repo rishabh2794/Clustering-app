@@ -1,9 +1,15 @@
 # app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
-# with Map-Click Start & Address Search (no GPS/IP needed)
+# with Map-Click Start, Address Search, Per-Issue Camera/Upload, and ZIP Export
 # ----------------------------------------------------------------------------
 
 import math
+import os
+import io
+import csv
+import zipfile
 import tempfile
+from datetime import datetime
+
 import requests
 import numpy as np
 import pandas as pd
@@ -161,6 +167,13 @@ if "origin_lat" not in st.session_state:
     st.session_state.origin_lat = None
 if "origin_lon" not in st.session_state:
     st.session_state.origin_lon = None
+
+# Store uploaded after-photos and session root dir for files
+if "uploaded_after_photos" not in st.session_state:
+    # {issue_id: [ {path, saved_name, original_name, source, ward, status, ts_str}, ... ]}
+    st.session_state.uploaded_after_photos = {}
+if "photos_base_dir" not in st.session_state:
+    st.session_state.photos_base_dir = tempfile.mkdtemp(prefix="after_photos_session_")
 
 # ----------------- Inputs (unique keys) -----------------
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader_main")
@@ -333,14 +346,12 @@ else:
         start, end = 0, min(10, len(seq_df))
         batch_df = seq_df.iloc[start:end].copy()
 
-    # ----- Show batch table (ADDED: clickable Before Photo link) -----
+    # ----- Show batch table (Before Photo as clickable link) -----
     batch_df_display = (
         batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']]
         .reset_index(drop=True)
     )
     batch_df_display.index = batch_df_display.index + 1  # 1-based row numbers
-
-    # Clean non-URLs so empty cells don't show broken links
     batch_df_display['BEFORE PHOTO'] = batch_df_display['BEFORE PHOTO'].apply(
         lambda x: x if is_url(str(x).strip()) else None
     )
@@ -358,7 +369,102 @@ else:
             ),
         }
     )
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------
+
+    # ----- Per-issue Camera + Upload (ALWAYS available; no After link shown) -----
+    st.markdown("**Upload / Click After Photo for each issue in this batch:**")
+
+    def _save_img_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
+        ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # Folder per issue id inside session base dir
+        abs_dir = os.path.join(st.session_state.photos_base_dir, "after_photos", issue_id)
+        os.makedirs(abs_dir, exist_ok=True)
+        saved_name = f"{issue_id}_after_{ts_str}.jpg"
+        abs_path = os.path.join(abs_dir, saved_name)
+        with open(abs_path, "wb") as f:
+            f.write(img_bytes)
+        rec = {
+            "path": abs_path,
+            "saved_name": saved_name,
+            "original_name": original_name,
+            "source": source,  # "camera" or "upload"
+            "ward": str(ward),
+            "status": str(status),
+            "ts_str": ts_str,
+        }
+        st.session_state.uploaded_after_photos.setdefault(issue_id, []).append(rec)
+
+    for _, row in batch_df.iterrows():
+        issue_id = str(row['ISSUE ID'])
+        ward     = row.get('WARD', '')
+        status   = row.get('STATUS', '')
+
+        col_info, col_cam, col_upl = st.columns([3,2,2])
+        with col_info:
+            st.caption(f"Issue **{issue_id}** — Ward {ward}, Status: {status}")
+
+        with col_cam:
+            cam = st.camera_input(f"Take photo ({issue_id})", key=f"cam_{issue_id}")
+            if cam is not None:
+                _save_img_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
+                st.success("Captured ✅")
+
+        with col_upl:
+            up = st.file_uploader(f"Upload photo ({issue_id})", type=["jpg","jpeg","png"], key=f"upl_{issue_id}")
+            if up is not None:
+                _save_img_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
+                st.success("Uploaded ✅")
+
+        if issue_id in st.session_state.uploaded_after_photos:
+            st.caption(f"Saved photos in session: {len(st.session_state.uploaded_after_photos[issue_id])} 📸")
+
+    # ---------------- ZIP Download of all uploaded photos (with manifest) ----------------
+    st.divider()
+    st.subheader("Download all clicked/uploaded After Photos")
+
+    if st.session_state.uploaded_after_photos:
+        # Build manifest in-memory
+        manifest_rows = []
+        for issue_id, items in st.session_state.uploaded_after_photos.items():
+            for it in items:
+                manifest_rows.append([
+                    issue_id,
+                    it["ward"],
+                    it["status"],
+                    f"after_photos/{issue_id}/{it['saved_name']}",
+                    it["original_name"],
+                    it["source"],
+                    it["ts_str"],
+                ])
+
+        # Create ZIP in memory
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # Add images in per-issue folders
+            for issue_id, items in st.session_state.uploaded_after_photos.items():
+                for it in items:
+                    arcname = f"after_photos/{issue_id}/{it['saved_name']}"
+                    zf.write(it["path"], arcname)
+
+            # Add manifest CSV
+            manifest_csv = io.StringIO()
+            writer = csv.writer(manifest_csv)
+            writer.writerow(["ISSUE_ID","WARD","STATUS","SAVED_FILENAME","ORIGINAL_NAME","SOURCE","TIMESTAMP"])
+            writer.writerows(manifest_rows)
+            zf.writestr("after_photos_manifest.csv", manifest_csv.getvalue())
+
+        zip_buf.seek(0)
+        zip_name = datetime.now().strftime("after_photos_%Y-%m-%d_%H%M.zip")
+        st.download_button(
+            "⬇️ Download All After Photos (ZIP + manifest)",
+            data=zip_buf,
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True
+        )
+    else:
+        st.info("No After Photos captured/uploaded in this session yet.")
+    # -------------------------------------------------------------------------------
 
     # Google Maps link for this batch (origin optional)
     if not batch_df.empty:
@@ -433,7 +539,6 @@ for _, row in plot_df.iterrows():
         color, size = 'red', 7
 
     before_url = str(row.get('BEFORE PHOTO', '') or '').strip()
-    after_url  = str(row.get('AFTER PHOTO', '') or '').strip()
     ward       = escape(str(row.get('WARD', '') or ''))
     status     = escape(str(row.get('STATUS', '') or ''))
     cluster    = row.get('CLUSTER NUMBER', '')
@@ -452,10 +557,8 @@ for _, row in plot_df.iterrows():
         parts.append(f"<a href='{before_url}' target='_blank'>Before photo</a>")
         if show_thumbs:
             parts.append(f"<div><img src='{before_url}' style='max-width:220px;border:1px solid #ccc;border-radius:6px;'/></div>")
-    if is_url(after_url):
-        parts.append(f"<a href='{after_url}' target='_blank'>After photo</a>")
-        if show_thumbs:
-            parts.append(f"<div><img src='{after_url}' style='max-width:220px;border:1px solid #ccc;border-radius:6px;'/></div>")
+
+    # NOTE: As requested, we do NOT show or add an After Photo link anywhere.
 
     popup_html = "<div style='font-size:13px;line-height:1.25'>" + "<br>".join(parts) + "</div>"
     popup = folium.Popup(popup_html, max_width=280)

@@ -1,14 +1,18 @@
-# app.py — Clustering + Batch Navigation + Per-Row Upload + Camera + ZIP Export
+# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
+# with Map-Click Start & Address Search (no GPS/IP needed)
 # ----------------------------------------------------------------------------
+# Added: JSON persistence for visited/skipped + photo counts (no photos saved to disk!)
+# - Progress JSON: ./progress/<dataset_id>.json
+# - Remembers visited/skipped and how many photos uploaded per Issue ID
+# - Actual photos remain session-only (in memory); use the ZIP download to keep them
 
 import math
-import os
 import io
-import csv
-import zipfile
-import tempfile
+import json
+import hashlib
+from pathlib import Path
 from datetime import datetime
-
+import tempfile
 import requests
 import numpy as np
 import pandas as pd
@@ -32,6 +36,44 @@ import folium
 from folium.plugins import MarkerCluster
 from openpyxl import load_workbook
 from streamlit_folium import st_folium  # << for map click
+from html import escape
+
+# ----------------- JSON Progress Persistence -----------------
+PROGRESS_ROOT = Path("./progress")
+PROGRESS_ROOT.mkdir(parents=True, exist_ok=True)
+
+def dataset_fingerprint(file_bytes: bytes) -> str:
+    """Stable ID for the uploaded CSV so we can restore progress on re-uploads."""
+    return hashlib.sha1(file_bytes).hexdigest()
+
+def progress_path(dataset_id: str) -> Path:
+    return PROGRESS_ROOT / f"{dataset_id}.json"
+
+def load_progress(dataset_id: str):
+    """Return (visited_set, skipped_set, photo_counts_dict)."""
+    p = progress_path(dataset_id)
+    if p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        visited = set(map(str, data.get("visited_ticket_ids", [])))
+        skipped = set(map(str, data.get("skipped_ticket_ids", [])))
+        photo_counts = data.get("uploaded_after_photos", {})  # {issue_id: count}
+        return visited, skipped, photo_counts
+    return set(), set(), {}
+
+def save_progress(dataset_id: str, visited_ids: set, skipped_ids: set, photo_counts: dict):
+    """Persist visited/skipped and photo counts (no image bytes/paths)."""
+    if not dataset_id:
+        return
+    p = progress_path(dataset_id)
+    payload = {
+        "visited_ticket_ids": sorted(list(visited_ids)),
+        "skipped_ticket_ids": sorted(list(skipped_ids)),
+        "uploaded_after_photos": photo_counts,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 # ----------------- Constants -----------------
 EARTH_RADIUS_M = 6_371_000.0
@@ -166,13 +208,16 @@ if "origin_lat" not in st.session_state:
     st.session_state.origin_lat = None
 if "origin_lon" not in st.session_state:
     st.session_state.origin_lon = None
-
-# Store uploaded after-photos and session root dir for files
+# Session-only photo storage (bytes, no disk)
 if "uploaded_after_photos" not in st.session_state:
-    # {issue_id: [ {path, saved_name, original_name, source, ward, status, ts_str}, ... ]}
+    # {issue_id: [ {bytes, saved_name, original_name, source, ward, status, ts_str}, ... ]}
     st.session_state.uploaded_after_photos = {}
-if "photos_base_dir" not in st.session_state:
-    st.session_state.photos_base_dir = tempfile.mkdtemp(prefix="after_photos_session_")
+# Restored counts from JSON
+if "restored_photo_counts" not in st.session_state:
+    st.session_state.restored_photo_counts = {}
+# Dataset id in session
+if "dataset_id" not in st.session_state:
+    st.session_state.dataset_id = None
 
 # ----------------- Inputs (unique keys) -----------------
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader_main")
@@ -197,12 +242,24 @@ if not csv_file:
     st.info("Upload the required CSV to proceed.")
     st.stop()
 
-# Data load + filter (+ robust coord cleanup)
-df = pd.read_csv(csv_file)
+# Read raw bytes to compute dataset_id and parse CSV
+csv_bytes = csv_file.getvalue()
+dataset_id = dataset_fingerprint(csv_bytes)
+st.session_state.dataset_id = dataset_id
+st.caption(f"Dataset ID: `{dataset_id[:8]}…`")
+
+# Load CSV from bytes (not direct file handle)
+df = pd.read_csv(io.BytesIO(csv_bytes))
 missing = list(REQUIRED_COLS - set(df.columns))
 if missing:
     st.error(f"Missing required columns: {missing}")
     st.stop()
+
+# Restore prior progress (visited/skipped/photo counts)
+rest_visited, rest_skipped, rest_photo_counts = load_progress(dataset_id)
+st.session_state.visited_ticket_ids |= rest_visited
+st.session_state.skipped_ticket_ids |= rest_skipped
+st.session_state.restored_photo_counts = rest_photo_counts
 
 df['SUBCATEGORY_NORM'] = normalize_subcategory(df['SUBCATEGORY'])
 df = df[df['SUBCATEGORY_NORM'] == subcategory_option.lower()].copy()
@@ -311,7 +368,7 @@ else:
     st.warning("No start set. It’s okay—your Google Maps link will still start from the phone’s current GPS.")
 
 # ---------------- Batch + Skip/Mark ----------------
-st.subheader("Step 5: Batches of 10 — View • Upload • Skip • Mark")
+st.subheader("Step 5: Batches of 10 — View • Skip • Mark")
 
 # Filter out visited/skipped from the pool
 pool = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
@@ -322,7 +379,7 @@ st.caption(f"Remaining eligible tickets: {len(pool)} | Visited: {len(st.session_
 
 if pool.empty:
     st.info("No tickets remaining after filters/visited/skipped.")
-    batch_df = pd.DataFrame(columns=['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE'])
+    batch_df = pd.DataFrame(columns=['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO'])
 else:
     # Seed NN: from start point; else from dataset centroid
     if origin_lat is None or origin_lon is None:
@@ -345,120 +402,108 @@ else:
         start, end = 0, min(10, len(seq_df))
         batch_df = seq_df.iloc[start:end].copy()
 
-    # ----- Render a table-like layout WITH per-row uploader (and camera) -----
-    st.markdown("### Current Batch (with per-row Upload/Camera)")
+    # Show batch table (with Before Photo link)
+    batch_df_display = batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']].reset_index(drop=True)
+    batch_df_display.index = batch_df_display.index + 1  # 1-based row numbers
+    # Linkify BEFORE PHOTO in the table
+    def as_link_or_none(x):
+        s = str(x or "").strip()
+        return s if is_url(s) else None
+    batch_df_display['BEFORE PHOTO'] = batch_df_display['BEFORE PHOTO'].apply(as_link_or_none)
 
-    # Table header
-    hdr = st.columns([1, 2.2, 2.2, 2.2, 3.0, 2.8, 3.6])
-    hdr[0].markdown("**#**")
-    hdr[1].markdown("**Issue ID**")
-    hdr[2].markdown("**Ward**")
-    hdr[3].markdown("**Status**")
-    hdr[4].markdown("**Lat, Lon**")
-    hdr[5].markdown("**Before Photo**")
-    hdr[6].markdown("**Upload / Click After Photo**")
+    st.dataframe(
+        batch_df_display,
+        use_container_width=True,
+        column_config={
+            'LATITUDE': st.column_config.NumberColumn('LATITUDE', format="%.6f"),
+            'LONGITUDE': st.column_config.NumberColumn('LONGITUDE', format="%.6f"),
+            'BEFORE PHOTO': st.column_config.LinkColumn('Before Photo', display_text='Open'),
+        }
+    )
 
-    def _save_img_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
+    # ------------- After Photo uploads panel (session-only, no disk) -------------
+    st.markdown("### After Photo uploads for current batch")
+    def _save_photo_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
         ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        # Folder per issue id inside session base dir
-        abs_dir = os.path.join(st.session_state.photos_base_dir, "after_photos", issue_id)
-        os.makedirs(abs_dir, exist_ok=True)
         saved_name = f"{issue_id}_after_{ts_str}.jpg"
-        abs_path = os.path.join(abs_dir, saved_name)
-        with open(abs_path, "wb") as f:
-            f.write(img_bytes)
-        rec = {
-            "path": abs_path,
+        st.session_state.uploaded_after_photos.setdefault(str(issue_id), []).append({
+            "bytes": img_bytes,
             "saved_name": saved_name,
             "original_name": original_name,
-            "source": source,  # "camera" or "upload"
+            "source": source,               # "camera" or "upload"
             "ward": str(ward),
             "status": str(status),
             "ts_str": ts_str,
-        }
-        st.session_state.uploaded_after_photos.setdefault(issue_id, []).append(rec)
+        })
+        # Update JSON counts immediately
+        counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
+        save_progress(st.session_state.dataset_id,
+                      st.session_state.visited_ticket_ids,
+                      st.session_state.skipped_ticket_ids,
+                      counts)
 
-    # Render rows
-    for idx, row in batch_df.reset_index(drop=True).iterrows():
+    for _, row in batch_df.iterrows():
         issue_id = str(row['ISSUE ID'])
-        ward     = str(row.get('WARD', ''))
-        status   = str(row.get('STATUS', ''))
-        lat      = float(row['LATITUDE'])
-        lon      = float(row['LONGITUDE'])
-        before   = str(row.get('BEFORE PHOTO', '') or '').strip()
+        ward     = row.get('WARD', '')
+        status   = row.get('STATUS', '')
 
-        c = st.columns([1, 2.2, 2.2, 2.2, 3.0, 2.8, 3.6])
-        c[0].markdown(f"{idx+1}")
-        c[1].markdown(issue_id)
-        c[2].markdown(ward)
-        c[3].markdown(status)
-        c[4].markdown(f"{lat:.6f}, {lon:.6f}")
-        if is_url(before):
-            c[5].markdown(f"[Open]({before})")
-        else:
-            c[5].markdown("—")
+        st.markdown(f"**Issue {issue_id}** — Ward {ward}, Status: {status}")
+        cam = st.camera_input(f"Take photo ({issue_id})", key=f"cam_{issue_id}")
+        if cam is not None:
+            _save_photo_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
+            st.success("Captured ✅")
 
-        # Uploader inside the 'table cell'
-        up = c[6].file_uploader(
-            label=f"Upload After Photo for {issue_id}",
+        up = st.file_uploader(
+            f"Upload photo ({issue_id})",
             type=["jpg","jpeg","png"],
-            key=f"upl_tbl_{issue_id}",
-            label_visibility="collapsed",
-            accept_multiple_files=False
+            key=f"upl_{issue_id}"
         )
         if up is not None:
-            _save_img_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
-            c[6].markdown("✅ Saved")
+            _save_photo_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
+            st.success("Uploaded ✅")
 
-        # Optional camera in the same cell
-        cam = c[6].camera_input(
-            label=f"Take photo ({issue_id})",
-            key=f"cam_tbl_{issue_id}",
-            label_visibility="collapsed"
-        )
-        if cam is not None:
-            _save_img_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
-            c[6].markdown("✅ Captured")
-
+        # Status line (session vs restored)
         if issue_id in st.session_state.uploaded_after_photos:
             cnt = len(st.session_state.uploaded_after_photos[issue_id])
-            c[6].caption(f"{cnt} saved in session")
-    # -------------------------------------------------------------------------
+            st.info(f"✅ {cnt} photo(s) saved in this session")
+        elif issue_id in st.session_state.restored_photo_counts:
+            cnt = st.session_state.restored_photo_counts[issue_id]
+            st.info(f"✅ {cnt} photo(s) previously saved (no files in session)")
+        else:
+            st.warning("⚠️ No After Photo saved yet")
 
-    # ---------------- ZIP Download of all uploaded photos (with manifest) ----------------
-    st.divider()
+        st.divider()
+    # ---------------------------------------------------------------------------
+
+    # ---------------- ZIP Download of all session photos (with manifest) ----------------
     st.subheader("Download all clicked/uploaded After Photos")
+    import zipfile, csv
 
     if st.session_state.uploaded_after_photos:
-        # Build manifest in-memory
-        manifest_rows = []
-        for issue_id, items in st.session_state.uploaded_after_photos.items():
-            for it in items:
-                manifest_rows.append([
-                    issue_id,
-                    it["ward"],
-                    it["status"],
-                    f"after_photos/{issue_id}/{it['saved_name']}",
-                    it["original_name"],
-                    it["source"],
-                    it["ts_str"],
-                ])
-
-        # Create ZIP in memory
+        # Build manifest rows and zip from memory (no disk writes)
+        rows = []
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            # Add images in per-issue folders
             for issue_id, items in st.session_state.uploaded_after_photos.items():
                 for it in items:
-                    arcname = f"after_photos/{issue_id}/{it['saved_name']}"
-                    zf.write(it["path"], arcname)
-
-            # Add manifest CSV
-            manifest_csv = io.StringIO()
-            writer = csv.writer(manifest_csv)
+                    rel_path = f"after_photos/{issue_id}/{it['saved_name']}"
+                    # write image bytes directly
+                    zf.writestr(rel_path, it["bytes"])
+                    rows.append([
+                        issue_id,
+                        it.get("ward",""),
+                        it.get("status",""),
+                        rel_path,
+                        it.get("original_name",""),
+                        it.get("source",""),
+                        it.get("ts_str",""),
+                    ])
+            # Add CSV manifest
+            csv_io = io.StringIO()
+            writer = csv.writer(csv_io)
             writer.writerow(["ISSUE_ID","WARD","STATUS","SAVED_FILENAME","ORIGINAL_NAME","SOURCE","TIMESTAMP"])
-            writer.writerows(manifest_rows)
-            zf.writestr("after_photos_manifest.csv", manifest_csv.getvalue())
+            writer.writerows(rows)
+            zf.writestr("after_photos_manifest.csv", csv_io.getvalue())
 
         zip_buf.seek(0)
         zip_name = datetime.now().strftime("after_photos_%Y-%m-%d_%H%M.zip")
@@ -467,7 +512,8 @@ else:
             data=zip_buf,
             file_name=zip_name,
             mime="application/zip",
-            use_container_width=True
+            use_container_width=True,
+            help="Includes only photos from THIS session (restored counts do not include files)"
         )
     else:
         st.info("No After Photos captured/uploaded in this session yet.")
@@ -485,22 +531,32 @@ else:
     c1, c2, c3, c4 = st.columns(4)
     first_id = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
 
+    def _persist_counts_now():
+        counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
+        save_progress(st.session_state.dataset_id,
+                      st.session_state.visited_ticket_ids,
+                      st.session_state.skipped_ticket_ids,
+                      counts)
+
     with c1:
         if st.button("✅ Mark first as Visited", key="btn_mark_first"):
             if first_id:
                 st.session_state.visited_ticket_ids.add(first_id)
+                _persist_counts_now()
                 st.rerun()
 
     with c2:
         if st.button("⏭️ Skip first", key="btn_skip_first"):
             if first_id:
                 st.session_state.skipped_ticket_ids.add(first_id)
+                _persist_counts_now()
                 st.rerun()
 
     with c3:
         if st.button("✅ Mark entire batch as Visited", key="btn_mark_batch"):
             for _id in batch_df['ISSUE ID'].astype(str).tolist():
                 st.session_state.visited_ticket_ids.add(_id)
+            _persist_counts_now()
             st.rerun()
 
     with c4:
@@ -511,7 +567,6 @@ else:
 # ---------------- Map (+ clickable image links / thumbnails) ----------------
 st.subheader("Step 6: Map")
 
-from html import escape
 show_thumbs = st.checkbox("Show image thumbnails in popups (may slow the map)", value=False, key="cb_thumbs")
 
 center_lat = float(df['LATITUDE'].mean())
@@ -522,8 +577,8 @@ mc = MarkerCluster(name="Tickets").add_to(m)
 plot_df = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
 
 # Color coding: visited = gray, skipped = purple, current batch = orange, first = green
-batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if not pool.empty and not batch_df.empty else set()
-first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if not pool.empty and not batch_df.empty else None
+batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if 'batch_df' in locals() and not batch_df.empty else set()
+first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if 'batch_df' in locals() and not batch_df.empty else None
 
 # Start marker if set
 if origin_lat is not None and origin_lon is not None:

@@ -1,7 +1,10 @@
-# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups + Local Auto-Save
+# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
+# Local auto-save version: JSON persistence ensures progress survives refreshes or interruptions
 # ----------------------------------------------------------------------------
-# Added: JSON persistence + localStorage auto-save for visited/skipped + photo counts
-# - Session-only photos still stored in memory; ZIP download remains session-only
+# Added: JSON persistence for visited/skipped + photo counts (no photos saved to disk!)
+# - Progress JSON: ./progress/<dataset_id>.json
+# - Remembers visited/skipped and how many photos uploaded per Issue ID
+# - Actual photos remain session-only (in memory); use the ZIP download to keep them
 
 import math
 import io
@@ -14,9 +17,8 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-from html import escape
 
-# Optional heavy deps — guarded (GeoPandas/Fiona may be unavailable)
+# Optional heavy deps — guarded (GeoPandas/Fiona may be unavailable on Streamlit Cloud)
 try:
     import geopandas as gpd
     HAVE_GPD = True
@@ -33,31 +35,34 @@ from sklearn.cluster import DBSCAN
 import folium
 from folium.plugins import MarkerCluster
 from openpyxl import load_workbook
-from streamlit_folium import st_folium
-from streamlit_js_eval import streamlit_js_eval  # <- for localStorage
+from streamlit_folium import st_folium  # << for map click
+from html import escape
 
 # ----------------- JSON Progress Persistence -----------------
 PROGRESS_ROOT = Path("./progress")
 PROGRESS_ROOT.mkdir(parents=True, exist_ok=True)
 
 def dataset_fingerprint(file_bytes: bytes) -> str:
+    """Stable ID for the uploaded CSV so we can restore progress on re-uploads."""
     return hashlib.sha1(file_bytes).hexdigest()
 
 def progress_path(dataset_id: str) -> Path:
     return PROGRESS_ROOT / f"{dataset_id}.json"
 
 def load_progress(dataset_id: str):
+    """Return (visited_set, skipped_set, photo_counts_dict)."""
     p = progress_path(dataset_id)
     if p.exists():
         with p.open("r", encoding="utf-8") as f:
             data = json.load(f)
         visited = set(map(str, data.get("visited_ticket_ids", [])))
         skipped = set(map(str, data.get("skipped_ticket_ids", [])))
-        photo_counts = data.get("uploaded_after_photos", {})
+        photo_counts = data.get("uploaded_after_photos", {})  # {issue_id: count}
         return visited, skipped, photo_counts
     return set(), set(), {}
 
 def save_progress(dataset_id: str, visited_ids: set, skipped_ids: set, photo_counts: dict):
+    """Persist visited/skipped and photo counts (no image bytes/paths)."""
     if not dataset_id:
         return
     p = progress_path(dataset_id)
@@ -107,7 +112,7 @@ def hyperlinkify_excel(excel_path):
         wb = load_workbook(excel_path)
         ws = wb["Clustering Application Summary"]
         for row in range(2, ws.max_row + 1):
-            for col in (11, 12):
+            for col in (11, 12):  # BEFORE/AFTER PHOTO columns
                 link = ws.cell(row, col).value
                 if link and isinstance(link, str) and link.startswith(("http://", "https://")):
                     ws.cell(row, col).hyperlink = link
@@ -185,17 +190,6 @@ def build_nearest_neighbor_sequence(df_like: pd.DataFrame, start_lat: float, sta
 def is_url(u):
     return isinstance(u, str) and u.startswith(("http://", "https://"))
 
-# ----------------- LocalStorage Auto-Save -----------------
-def autosave_local():
-    save_data = {
-        "visited_ticket_ids": list(st.session_state.visited_ticket_ids),
-        "skipped_ticket_ids": list(st.session_state.skipped_ticket_ids),
-        "uploaded_after_photos_counts": {iid: len(items)
-                                         for iid, items in st.session_state.uploaded_after_photos.items()}
-    }
-    js_code = f"localStorage.setItem('clusterAppState', '{json.dumps(save_data)}');"
-    streamlit_js_eval(js_code=js_code, key=f"autosave_js_{datetime.now().timestamp()}")
-
 # ----------------- App Setup -----------------
 st.set_page_config(layout="wide", page_title="Clustering + Batch Navigation")
 st.title("🗺️ Clustering + Batch Navigation (Map-Click Start • Skip/Mark • Downloads)")
@@ -217,82 +211,143 @@ if "restored_photo_counts" not in st.session_state:
 if "dataset_id" not in st.session_state:
     st.session_state.dataset_id = None
 
-# Restore from localStorage first
-saved_json = streamlit_js_eval(js_code="localStorage.getItem('clusterAppState')", key="load_localstorage")
-if saved_json:
-    try:
-        data = json.loads(saved_json)
-        st.session_state.visited_ticket_ids |= set(data.get("visited_ticket_ids", []))
-        st.session_state.skipped_ticket_ids |= set(data.get("skipped_ticket_ids", []))
-        st.session_state.restored_photo_counts |= data.get("uploaded_after_photos_counts", {})
-    except Exception:
-        pass
-
 # ----------------- Inputs -----------------
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader_main")
 ward_file = st.file_uploader("Upload Wards file (optional)", type=["geojson","json","kml"], key="ward_uploader_main")
+
 subcategory_option = st.selectbox(
     "Issue Subcategory",
-    ["Pothole","Garbage dumped on public land","Unpaved Road","Broken Footpath / Divider",
-     "Sand piled on roadsides + Mud/slit on roadside","Malba, bricks, bori, etc dumped on public land",
-     "Construction/ demolition activity without safeguards","Encroachment-Building Materials Dumped on Road",
-     "Burning of garbage, plastic, leaves, branches etc.","Overflowing Dustbins",
-     "Barren land to be greened","Greening of Central Verges","Unsurfaced Parking Lots"],
+    [
+        "Pothole","Garbage dumped on public land","Unpaved Road","Broken Footpath / Divider",
+        "Sand piled on roadsides + Mud/slit on roadside","Malba, bricks, bori, etc dumped on public land",
+        "Construction/ demolition activity without safeguards","Encroachment-Building Materials Dumped on Road",
+        "Burning of garbage, plastic, leaves, branches etc.","Overflowing Dustbins",
+        "Barren land to be greened","Greening of Central Verges","Unsurfaced Parking Lots"
+    ],
     key="sel_subcategory"
 )
 radius_m = st.number_input("Clustering radius (m)", 1, 1000, 15, key="num_radius")
 min_samples = st.number_input("Minimum per cluster", 1, 100, 2, key="num_min_samples")
 
-# ----------------- Main -----------------
 if not csv_file:
     st.info("Upload the required CSV to proceed.")
     st.stop()
 
+# Read CSV
 csv_bytes = csv_file.getvalue()
 dataset_id = dataset_fingerprint(csv_bytes)
 st.session_state.dataset_id = dataset_id
+st.caption(f"Dataset ID: `{dataset_id[:8]}…`")
 
-# Load CSV
-df = pd.read_csv(csv_file)
-for c in REQUIRED_COLS:
-    if c not in df.columns:
-        st.error(f"Missing required column: {c}")
-        st.stop()
+df = pd.read_csv(io.BytesIO(csv_bytes))
+missing = list(REQUIRED_COLS - set(df.columns))
+if missing:
+    st.error(f"Missing required columns: {missing}")
+    st.stop()
 
-df['LATITUDE'] = pd.to_numeric(df['LATITUDE'], errors='coerce')
-df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
-df = df[df['LATITUDE'].notna() & df['LONGITUDE'].notna()]
+# Restore progress
+rest_visited, rest_skipped, rest_photo_counts = load_progress(dataset_id)
+st.session_state.visited_ticket_ids |= rest_visited
+st.session_state.skipped_ticket_ids |= rest_skipped
+st.session_state.restored_photo_counts = rest_photo_counts
 
-# ----------------- Ward Overlay -----------------
-gdf_wards = None
-if ward_file:
+# ----------------- Subcategory Filtering -----------------
+df['SUBCATEGORY_NORM'] = normalize_subcategory(df['SUBCATEGORY'])
+df_sel = df[df['SUBCATEGORY_NORM'] == normalize_subcategory(pd.Series([subcategory_option])).iloc[0]]
+if df_sel.empty:
+    st.warning("No tickets found for this subcategory.")
+    st.stop()
+
+# Remove already visited/skipped
+df_sel = df_sel[~df_sel['ISSUE ID'].astype(str).isin(st.session_state.visited_ticket_ids | st.session_state.skipped_ticket_ids)]
+df_sel.reset_index(drop=True, inplace=True)
+
+if df_sel.empty:
+    st.info("All tickets for this subcategory are already visited or skipped.")
+    st.stop()
+
+# ----------------- Clustering -----------------
+coords = df_sel[['LATITUDE','LONGITUDE']].to_numpy()
+db = DBSCAN(eps=radius_m/1000/EARTH_RADIUS_M, min_samples=min_samples, algorithm='ball_tree', metric='haversine')
+df_sel['CLUSTER'] = db.fit_predict(np.radians(coords))
+
+# ----------------- Map Start -----------------
+st.subheader("🌍 Click map to select start location / search address")
+
+m = folium.Map(location=[df_sel['LATITUDE'].mean(), df_sel['LONGITUDE'].mean()], zoom_start=13)
+if ward_file and HAVE_GPD:
     gdf_wards = load_wards_uploaded(ward_file)
+    if gdf_wards is not None:
+        folium.GeoJson(gdf_wards.geometry).add_to(m)
 
-# ----------------- Batch Loop Example -----------------
-batch_size = 10
-pending_ids = [str(iid) for iid in df['ISSUE ID'].tolist() if iid not in st.session_state.visited_ticket_ids and iid not in st.session_state.skipped_ticket_ids]
-if not pending_ids:
-    st.success("✅ All tickets processed.")
-else:
-    batch_ids = pending_ids[st.session_state.batch_cursor:st.session_state.batch_cursor+batch_size]
-    batch_df = df[df['ISSUE ID'].astype(str).isin(batch_ids)]
-    for idx, row in batch_df.iterrows():
-        iid = str(row['ISSUE ID'])
-        st.subheader(f"Ticket {iid} | {row['SUBCATEGORY']} | {row['WARD']}")
-        if is_url(row['BEFORE PHOTO']):
-            st.image(row['BEFORE PHOTO'], width=300, caption="Before Photo")
-        uploaded_file = st.file_uploader(f"Upload AFTER photo for {iid}", key=f"after_{iid}")
+clicked_coords = st_folium(m, height=400, key="map_start_click")
+
+origin_lat, origin_lon = st.session_state.origin_lat, st.session_state.origin_lon
+if clicked_coords and clicked_coords.get("last_clicked"):
+    origin_lat = clicked_coords["last_clicked"]["lat"]
+    origin_lon = clicked_coords["last_clicked"]["lng"]
+    st.session_state.origin_lat = origin_lat
+    st.session_state.origin_lon = origin_lon
+
+addr_input = st.text_input("Or search address")
+if addr_input:
+    qlat, qlon = geocode_query(addr_input)
+    if qlat:
+        origin_lat, origin_lon = qlat, qlon
+        st.session_state.origin_lat, st.session_state.origin_lon = qlat, qlon
+        st.success(f"Address geocoded: {qlat},{qlon}")
+    else:
+        st.warning("Unable to geocode address.")
+
+if origin_lat is None or origin_lon is None:
+    st.info("Select start location on map or search address.")
+    st.stop()
+
+# ----------------- Nearest Neighbor Sequence -----------------
+batch_limit = 10
+nn_sequence = build_nearest_neighbor_sequence(df_sel, origin_lat, origin_lon, batch_limit)
+if not nn_sequence:
+    st.info("No tickets to visit in this batch.")
+    st.stop()
+
+# ----------------- Batch Navigation -----------------
+st.subheader(f"📝 Current Batch ({len(nn_sequence)} tickets)")
+
+for idx, ticket in enumerate(nn_sequence):
+    tid = str(ticket['ISSUE ID'])
+    st.markdown(f"**{idx+1}. {ticket['ADDRESS']} (ID: {tid})**")
+    cols = st.columns([2,2,1,1,1])
+    with cols[0]:
+        before_link = ticket['BEFORE PHOTO']
+        if is_url(before_link):
+            st.markdown(f"[Before]({before_link})", unsafe_allow_html=True)
+    with cols[1]:
+        st.markdown(f"[After]({ticket['AFTER PHOTO']})" if is_url(ticket['AFTER PHOTO']) else "No after photo")
+    with cols[2]:
+        if st.button(f"✅ Mark Visited {tid}", key=f"btn_visited_{tid}"):
+            st.session_state.visited_ticket_ids.add(tid)
+            save_progress(dataset_id, st.session_state.visited_ticket_ids, st.session_state.skipped_ticket_ids,
+                          st.session_state.uploaded_after_photos)
+            st.experimental_rerun()
+    with cols[3]:
+        if st.button(f"⏭️ Skip {tid}", key=f"btn_skip_{tid}"):
+            st.session_state.skipped_ticket_ids.add(tid)
+            save_progress(dataset_id, st.session_state.visited_ticket_ids, st.session_state.skipped_ticket_ids,
+                          st.session_state.uploaded_after_photos)
+            st.experimental_rerun()
+    with cols[4]:
+        uploaded_file = st.file_uploader(f"Upload After Photo {tid}", key=f"after_photo_{tid}", type=["jpg","png","jpeg"])
         if uploaded_file:
-            st.session_state.uploaded_after_photos.setdefault(iid, []).append(uploaded_file)
-            st.write(f"✅ Uploaded {len(st.session_state.uploaded_after_photos[iid])} photo(s)")
-            autosave_local()  # auto-save
-        col1, col2 = st.columns(2)
-        if col1.button(f"Mark Visited {iid}"):
-            st.session_state.visited_ticket_ids.add(iid)
-            autosave_local()
-            st.experimental_rerun()
-        if col2.button(f"Skip {iid}"):
-            st.session_state.skipped_ticket_ids.add(iid)
-            autosave_local()
-            st.experimental_rerun()
+            if tid not in st.session_state.uploaded_after_photos:
+                st.session_state.uploaded_after_photos[tid] = []
+            st.session_state.uploaded_after_photos[tid].append(uploaded_file.name)
+            save_progress(dataset_id, st.session_state.visited_ticket_ids, st.session_state.skipped_ticket_ids,
+                          st.session_state.uploaded_after_photos)
+            st.success(f"Uploaded {uploaded_file.name}. Total uploaded: {len(st.session_state.uploaded_after_photos[tid])}")
+
+# ----------------- Summary -----------------
+st.subheader("📊 Batch Summary")
+st.write(f"Visited this session: {len(st.session_state.visited_ticket_ids)}")
+st.write(f"Skipped this session: {len(st.session_state.skipped_ticket_ids)}")
+st.write(f"After photos uploaded: {sum(len(v) for v in st.session_state.uploaded_after_photos.values())}")
 

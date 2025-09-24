@@ -1,4 +1,4 @@
-app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
+# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
 # with Map-Click Start & Address Search (no GPS/IP needed)
 # ----------------------------------------------------------------------------
 # Added: JSON persistence for visited/skipped + photo counts (no photos saved to disk!)
@@ -501,3 +501,4 @@ else:
         if st.button("➡️ Next batch", key="btn_next_batch"):
             st.session_state.batch_cursor = end if end < len(seq_df) else 0
             st.rerun()
+

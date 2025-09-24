@@ -8,3 +8,16 @@ openpyxl>=3.1
 requests>=2.31
 geopandas>=0.14
 fiona>=1.9
+streamlit
+pandas
+numpy
+geopandas
+scikit-learn
+folium
+shapely
+openpyxl
+fiona
+requests
+streamlit-geolocation
+streamlit-folium
+

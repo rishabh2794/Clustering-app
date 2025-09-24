@@ -10,3 +10,5 @@ fiona
 requests
 streamlit-geolocation
 streamlit-folium
+pip install streamlit-js-eval
+

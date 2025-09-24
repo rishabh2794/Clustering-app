@@ -18,13 +18,25 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Optional heavy deps — guarded (GeoPandas/Fiona may be unavailable on Streamlit Cloud)
+try:
+    import geopandas as gpd
+    HAVE_GPD = True
+except Exception:
+    HAVE_GPD = False
+
+try:
+    import fiona
+    HAS_FIONA = True
+except Exception:
+    HAS_FIONA = False
+
 from sklearn.cluster import DBSCAN
 import folium
 from folium.plugins import MarkerCluster
 from openpyxl import load_workbook
-from streamlit_folium import st_folium  # << for map click and map display
+from streamlit_folium import st_folium  # << for map click
 from html import escape
-from urllib.parse import quote
 
 # ----------------- JSON Progress Persistence -----------------
 PROGRESS_ROOT = Path("./progress")
@@ -45,7 +57,7 @@ def load_progress(dataset_id: str):
             data = json.load(f)
         visited = set(map(str, data.get("visited_ticket_ids", [])))
         skipped = set(map(str, data.get("skipped_ticket_ids", [])))
-        photo_counts = {str(k): int(v) for k, v in data.get("uploaded_after_photos", {}).items()}
+        photo_counts = data.get("uploaded_after_photos", {})  # {issue_id: count}
         return visited, skipped, photo_counts
     return set(), set(), {}
 
@@ -55,9 +67,9 @@ def save_progress(dataset_id: str, visited_ids: set, skipped_ids: set, photo_cou
         return
     p = progress_path(dataset_id)
     payload = {
-        "visited_ticket_ids": sorted(list(map(str, visited_ids))),
-        "skipped_ticket_ids": sorted(list(map(str, skipped_ids))),
-        "uploaded_after_photos": {str(k): int(v) for k, v in photo_counts.items()},
+        "visited_ticket_ids": sorted(list(visited_ids)),
+        "skipped_ticket_ids": sorted(list(skipped_ids)),
+        "uploaded_after_photos": photo_counts,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     with p.open("w", encoding="utf-8") as f:
@@ -91,6 +103,7 @@ def google_maps_url(origin_lat, origin_lon, dest_lat, dest_lon, mode="driving", 
     mode = mode if mode in {"driving","walking","bicycling","transit"} else "driving"
     parts.append(f"travelmode={mode}")
     if waypoints:
+        from urllib.parse import quote
         wp = "|".join([f"{lat},{lon}" for (lat,lon) in waypoints])
         parts.append(f"waypoints={quote(wp, safe='|,')}")
     return base + "&" + "&".join(parts)
@@ -98,26 +111,55 @@ def google_maps_url(origin_lat, origin_lon, dest_lat, dest_lon, mode="driving", 
 def hyperlinkify_excel(excel_path):
     try:
         wb = load_workbook(excel_path)
-        if "Clustering Application Summary" not in wb.sheetnames:
-            wb.save(excel_path)
-            return
         ws = wb["Clustering Application Summary"]
-        # safe guard: columns might be fewer
-        max_col = ws.max_column
         for row in range(2, ws.max_row + 1):
-            for col in (11, 12):  # BEFORE/AFTER PHOTO columns (1-based)
-                if col > max_col:
-                    continue
+            for col in (11, 12):  # BEFORE/AFTER PHOTO columns
                 link = ws.cell(row, col).value
                 if link and isinstance(link, str) and link.startswith(("http://", "https://")):
                     ws.cell(row, col).hyperlink = link
-                    try:
-                        ws.cell(row, col).style = "Hyperlink"
-                    except Exception:
-                        pass
+                    ws.cell(row, col).style = "Hyperlink"
         wb.save(excel_path)
     except Exception:
         pass
+
+def load_wards_uploaded(file):
+    """Ward file reader with KML guard. Returns GeoDataFrame or None."""
+    if not HAVE_GPD:
+        st.info("GeoPandas not available; ward overlay/join skipped.")
+        return None
+    try:
+        suffix = file.name.split(".")[-1].lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix="."+suffix) as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+
+        if suffix in ("geojson", "json"):
+            gdf = gpd.read_file(tmp_path)
+        elif suffix == "kml":
+            if not HAS_FIONA:
+                st.warning("KML requires Fiona/GDAL. Upload GeoJSON/JSON instead.")
+                return None
+            layers = fiona.listlayers(tmp_path)
+            gdf = None
+            for layer in layers:
+                gdf_try = gpd.read_file(tmp_path, driver="KML", layer=layer)
+                if not gdf_try.empty:
+                    gdf = gdf_try
+                    break
+            if gdf is None:
+                st.warning("No non-empty KML layers found.")
+                return None
+        else:
+            st.warning("Unsupported ward file type. Use GeoJSON/JSON/KML.")
+            return None
+
+        if gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
+        elif gdf.crs.to_string() != "EPSG:4326":
+            gdf = gdf.to_crs(epsg=4326)
+        return gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
+    except Exception:
+        return None
 
 def geocode_query(q: str, timeout=6):
     """Address/place geocoder (OSM Nominatim). Returns (lat, lon) or (None, None)."""
@@ -152,24 +194,6 @@ def build_nearest_neighbor_sequence(df_like: pd.DataFrame, start_lat: float, sta
 def is_url(u):
     return isinstance(u, str) and u.startswith(("http://", "https://"))
 
-def make_image_popup_html(image_url: str, issue_id: str, max_width=300):
-    """Return an HTML string safe to inject into an iframe popup for folium.
-    image_url should be a fully-qualified URL; we escape text parts.
-    """
-    safe_url = escape(image_url, quote=True)
-    safe_id = escape(str(issue_id))
-    # Click the thumbnail to open full image in new tab
-    html = f"""
-    <div style="font-family:Arial, sans-serif; font-size:12px;">
-      <b>Issue {safe_id}</b><br/>
-      <a href="{safe_url}" target="_blank" rel="noopener noreferrer">
-        <img src="{safe_url}" style="max-width:{max_width}px; height:auto; display:block; margin:6px 0;" />
-      </a>
-      <div><a href="{safe_url}" target="_blank" rel="noopener noreferrer">Open full image</a></div>
-    </div>
-    """
-    return html
-
 # ----------------- App Setup -----------------
 st.set_page_config(layout="wide", page_title="Clustering + Batch Navigation")
 st.title("🗺️ Clustering + Batch Navigation (Map-Click Start • Skip/Mark • Downloads)")
@@ -197,6 +221,7 @@ if "dataset_id" not in st.session_state:
 
 # ----------------- Inputs (unique keys) -----------------
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader_main")
+ward_file = st.file_uploader("Upload Wards file (optional)", type=["geojson","json","kml"], key="ward_uploader_main")
 
 subcategory_option = st.selectbox(
     "Issue Subcategory",
@@ -241,9 +266,8 @@ df = df[df['SUBCATEGORY_NORM'] == subcategory_option.lower()].copy()
 
 df['LATITUDE']  = pd.to_numeric(df['LATITUDE'], errors='coerce')
 df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
-# pandas between inclusive param depends on version; this is compatible with many versions.
-df = df[df['LATITUDE'].between(-90, 90)]
-df = df[df['LONGITUDE'].between(-180, 180)]
+df = df[df['LATITUDE'].between(-90, 90, inclusive='both')]
+df = df[df['LONGITUDE'].between(-180, 180, inclusive='both')]
 df.dropna(subset=['LATITUDE','LONGITUDE'], inplace=True)
 
 if df.empty:
@@ -263,20 +287,29 @@ except ValueError as e:
 df['CLUSTER NUMBER'] = labels
 df['IS_CLUSTERED'] = df['CLUSTER NUMBER'] != -1
 
-# We no longer perform ward overlay/join; keep gdf_all as a copy of df
-gdf_all = df.copy()
+# Optional GeoPandas overlay/join
+if HAVE_GPD:
+    gdf_all = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df['LONGITUDE'], df['LATITUDE']), crs="EPSG:4326")
+    wards_gdf = load_wards_uploaded(ward_file) if ward_file else None
+    if wards_gdf is not None and not wards_gdf.empty:
+        try:
+            gdf_all = gpd.sjoin(gdf_all, wards_gdf, how="left", predicate="within")
+        except Exception:
+            pass
+else:
+    gdf_all = df.copy()
 
 # Excel summary for clusters
 clustered = gdf_all[gdf_all['IS_CLUSTERED']]
 excel_filename = "Clustering_Application_Summary.xlsx"
 if not clustered.empty:
-    (clustered).to_excel(
+    (clustered.drop(columns=["geometry"]) if "geometry" in clustered.columns else clustered).to_excel(
         excel_filename, sheet_name='Clustering Application Summary', index=False
     )
     hyperlinkify_excel(excel_filename)
 
 # ---------------- Start Point (Map-Click + Address Search + Manual) ----------------
-st.subheader("Step 3: Set Start Point (No GPS Needed)")
+st.subheader("Step 4: Set Start Point (No GPS Needed)")
 
 # Address search (optional)
 colA, colB = st.columns(2)
@@ -289,7 +322,7 @@ with colA:
                 st.session_state.origin_lat = g_lat
                 st.session_state.origin_lon = g_lon
                 st.success(f"Start set from search: {g_lat:.6f}, {g_lon:.6f}")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Could not geocode that query. Try a more specific address.")
 with colB:
@@ -301,7 +334,7 @@ with colB:
             st.session_state.origin_lat = float(man_lat)
             st.session_state.origin_lon = float(man_lon)
             st.success(f"Manual start set: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
-            st.experimental_rerun()
+            st.rerun()
         except Exception:
             st.error("Invalid coordinates. Example: 26.8467, 80.9462")
 
@@ -325,7 +358,7 @@ if isinstance(click_state, dict):
         st.session_state.origin_lat = float(clicked["lat"])
         st.session_state.origin_lon = float(clicked["lng"])
         st.success(f"Start set from map click: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
-        st.experimental_rerun()
+        st.rerun()
 
 origin_lat = st.session_state.origin_lat
 origin_lon = st.session_state.origin_lon
@@ -335,10 +368,10 @@ else:
     st.warning("No start set. It’s okay—your Google Maps link will still start from the phone’s current GPS.")
 
 # ---------------- Batch + Skip/Mark ----------------
-st.subheader("Step 4: Batches of 10 — View • Skip • Mark")
+st.subheader("Step 5: Batches of 10 — View • Skip • Mark")
 
 # Filter out visited/skipped from the pool
-pool = (gdf_all).copy()
+pool = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
 pool = pool[~pool['ISSUE ID'].astype(str).isin(st.session_state.visited_ticket_ids)]
 pool = pool[~pool['ISSUE ID'].astype(str).isin(st.session_state.skipped_ticket_ids)]
 
@@ -387,45 +420,6 @@ else:
             'BEFORE PHOTO': st.column_config.LinkColumn('Before Photo', display_text='Open'),
         }
     )
-
-    # ---------------- MAP FOR CURRENT BATCH (clickable image popups) ----------------
-    st.markdown("### Map — current batch (click markers to view Before Photo)")
-    batch_map = folium.Map(location=[float(batch_df['LATITUDE'].mean()), float(batch_df['LONGITUDE'].mean())], zoom_start=13)
-    marker_cluster = MarkerCluster()
-    marker_cluster.add_to(batch_map)
-
-    any_image = False
-    for _, r in batch_df.iterrows():
-        lat = float(r['LATITUDE'])
-        lon = float(r['LONGITUDE'])
-        issue = str(r['ISSUE ID'])
-        before_link = r.get('BEFORE PHOTO', '')
-        popup_html = None
-
-        if is_url(before_link):
-            any_image = True
-            popup_html = make_image_popup_html(before_link, issue, max_width=280)
-        else:
-            # Fallback popup with text + link to data row (or address if present)
-            addr = escape(str(r.get('ADDRESS', 'No address')), quote=True)
-            popup_html = f"<div style='font-family:Arial, sans-serif; font-size:12px;'><b>Issue {escape(issue)}</b><br/>{addr}</div>"
-
-        iframe = folium.IFrame(html=popup_html, width=300, height=260)
-        popup = folium.Popup(iframe, max_width=320)
-        folium.Marker([lat, lon], popup=popup, tooltip=f"Issue {issue}").add_to(marker_cluster)
-
-    if not any_image:
-        st.info("No valid BEFORE PHOTO URLs found for this batch to display as thumbnails.")
-    # Fit to bounds if markers exist
-    try:
-        coords = batch_df[['LATITUDE','LONGITUDE']].values.tolist()
-        if coords:
-            batch_map.fit_bounds(coords)
-    except Exception:
-        pass
-
-    # show the folium map in streamlit
-    st_folium(batch_map, height=420, returned_objects=[])
 
     # ------------- After Photo uploads panel (session-only, no disk) -------------
     st.markdown("### After Photo uploads for current batch")
@@ -549,23 +543,105 @@ else:
             if first_id:
                 st.session_state.visited_ticket_ids.add(first_id)
                 _persist_counts_now()
-                st.experimental_rerun()
+                st.rerun()
 
     with c2:
         if st.button("⏭️ Skip first", key="btn_skip_first"):
             if first_id:
                 st.session_state.skipped_ticket_ids.add(first_id)
                 _persist_counts_now()
-                st.experimental_rerun()
+                st.rerun()
 
     with c3:
         if st.button("✅ Mark entire batch as Visited", key="btn_mark_batch"):
             for _id in batch_df['ISSUE ID'].astype(str).tolist():
                 st.session_state.visited_ticket_ids.add(_id)
             _persist_counts_now()
-            st.experimental_rerun()
+            st.rerun()
 
     with c4:
         if st.button("➡️ Next batch", key="btn_next_batch"):
             st.session_state.batch_cursor = end if end < len(seq_df) else 0
-            st.experimental_rerun()
+            st.rerun()
+
+# ---------------- Map (+ clickable image links / thumbnails) ----------------
+st.subheader("Step 6: Map")
+
+show_thumbs = st.checkbox("Show image thumbnails in popups (may slow the map)", value=False, key="cb_thumbs")
+
+center_lat = float(df['LATITUDE'].mean())
+center_lon = float(df['LONGITUDE'].mean())
+m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+mc = MarkerCluster(name="Tickets").add_to(m)
+
+plot_df = (gdf_all.drop(columns=["geometry"]) if "geometry" in getattr(gdf_all, "columns", []) else gdf_all).copy()
+
+# Color coding: visited = gray, skipped = purple, current batch = orange, first = green
+batch_ids = set(batch_df['ISSUE ID'].astype(str).tolist()) if 'batch_df' in locals() and not batch_df.empty else set()
+first_in_batch = str(batch_df.iloc[0]['ISSUE ID']) if 'batch_df' in locals() and not batch_df.empty else None
+
+# Start marker if set
+if origin_lat is not None and origin_lon is not None:
+    folium.Marker([origin_lat, origin_lon], popup="Start here",
+                  icon=folium.Icon(color="green", icon="flag")).add_to(m)
+
+for _, row in plot_df.iterrows():
+    rid = str(row['ISSUE ID'])
+    lat, lon = float(row['LATITUDE']), float(row['LONGITUDE'])
+
+    if rid == first_in_batch:
+        color, size = 'green', 10
+    elif rid in batch_ids:
+        color, size = 'orange', 9
+    elif rid in st.session_state.visited_ticket_ids:
+        color, size = 'gray', 7
+    elif rid in st.session_state.skipped_ticket_ids:
+        color, size = 'purple', 7
+    else:
+        color, size = 'red', 7
+
+    before_url = str(row.get('BEFORE PHOTO', '') or '').strip()
+    ward       = escape(str(row.get('WARD', '') or ''))
+    status     = escape(str(row.get('STATUS', '') or ''))
+    cluster    = row.get('CLUSTER NUMBER', '')
+    cluster    = int(cluster) if isinstance(cluster, (int, float)) and not pd.isna(cluster) else ''
+
+    parts = [
+        f"<b>Issue ID:</b> {escape(rid)}",
+        f"<b>Status:</b> {status}",
+        f"<b>Ward:</b> {ward}",
+        f"<b>Lat, Lon:</b> {lat:.6f}, {lon:.6f}",
+    ]
+    if cluster != '':
+        parts.insert(0, f"<b>Cluster:</b> {cluster}")
+
+    if is_url(before_url):
+        parts.append(f"<a href='{before_url}' target='_blank'>Before photo</a>")
+        if show_thumbs:
+            parts.append(f"<div><img src='{before_url}' style='max-width:220px;border:1px solid #ccc;border-radius:6px;'/></div>")
+
+    # NOTE: Per your instruction, no After Photo link is shown anywhere.
+
+    popup_html = "<div style='font-size:13px;line-height:1.25'>" + "<br>".join(parts) + "</div>"
+    popup = folium.Popup(popup_html, max_width=280)
+
+    folium.CircleMarker(
+        location=[lat, lon],
+        radius=size,
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.9,
+        popup=popup
+    ).add_to(mc)
+
+m.save("Clustering_Application_Map.html")
+
+# ---------------- Downloads ----------------
+st.subheader("Step 7: Downloads")
+if not clustered.empty:
+    with open("Clustering_Application_Summary.xlsx", "rb") as f:
+        st.download_button("Download Excel", f, file_name="Clustering_Application_Summary.xlsx", key="dl_excel")
+with open("Clustering_Application_Map.html", "rb") as f:
+    st.download_button("Download Map (HTML)", f, file_name="Clustering_Application_Map.html", key="dl_html")
+

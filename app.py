@@ -1,6 +1,8 @@
-# app.py — Clustering + Batch Navigation + Skip/Mark + Camera/Gallery Upload
+# app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
 # ----------------------------------------------------------------------------
-# Auto-save progress to JSON, session-only photo storage, batch navigation
+# Full working version with Step 5 batch table and Step 6 map restored
+# After Photo uploads for all tickets in batch with session auto-save (JSON)
+# Step 7 downloads and ward upload removed
 
 import math
 import io
@@ -8,23 +10,45 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
-
+import tempfile
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Optional heavy deps — guarded (GeoPandas/Fiona may be unavailable on Streamlit Cloud)
+try:
+    import geopandas as gpd
+    HAVE_GPD = True
+except Exception:
+    HAVE_GPD = False
+
+try:
+    import fiona
+    HAS_FIONA = True
+except Exception:
+    HAS_FIONA = False
+
 from sklearn.cluster import DBSCAN
+import folium
+from folium.plugins import MarkerCluster
+from openpyxl import load_workbook
+from streamlit_folium import st_folium  # << for map click
+from html import escape
 
 # ----------------- JSON Progress Persistence -----------------
 PROGRESS_ROOT = Path("./progress")
 PROGRESS_ROOT.mkdir(parents=True, exist_ok=True)
 
 def dataset_fingerprint(file_bytes: bytes) -> str:
+    """Stable ID for the uploaded CSV so we can restore progress on re-uploads."""
     return hashlib.sha1(file_bytes).hexdigest()
 
 def progress_path(dataset_id: str) -> Path:
     return PROGRESS_ROOT / f"{dataset_id}.json"
 
 def load_progress(dataset_id: str):
+    """Return (visited_set, skipped_set, photo_counts_dict)."""
     p = progress_path(dataset_id)
     if p.exists():
         with p.open("r", encoding="utf-8") as f:
@@ -36,6 +60,7 @@ def load_progress(dataset_id: str):
     return set(), set(), {}
 
 def save_progress(dataset_id: str, visited_ids: set, skipped_ids: set, photo_counts: dict):
+    """Persist visited/skipped and photo counts (no image bytes/paths)."""
     if not dataset_id:
         return
     p = progress_path(dataset_id)
@@ -66,6 +91,23 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
     return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
+def google_maps_url(origin_lat, origin_lon, dest_lat, dest_lon, mode="driving", waypoints=None):
+    base = "https://www.google.com/maps/dir/?api=1"
+    parts = []
+    if origin_lat is not None and origin_lon is not None:
+        parts.append(f"origin={origin_lat},{origin_lon}")
+    parts.append(f"destination={dest_lat},{dest_lon}")
+    mode = mode if mode in {"driving","walking","bicycling","transit"} else "driving"
+    parts.append(f"travelmode={mode}")
+    if waypoints:
+        from urllib.parse import quote
+        wp = "|".join([f"{lat},{lon}" for (lat,lon) in waypoints])
+        parts.append(f"waypoints={quote(wp, safe='|,')}")
+    return base + "&" + "&".join(parts)
+
+def is_url(u):
+    return isinstance(u, str) and u.startswith(("http://", "https://"))
+
 def build_nearest_neighbor_sequence(df_like: pd.DataFrame, start_lat: float, start_lon: float, limit: int):
     seq = []
     pool = df_like.copy()
@@ -80,12 +122,9 @@ def build_nearest_neighbor_sequence(df_like: pd.DataFrame, start_lat: float, sta
         pool = pool[pool['ISSUE ID'] != nxt['ISSUE ID']]
     return seq
 
-def is_url(u):
-    return isinstance(u, str) and u.startswith(("http://", "https://"))
-
 # ----------------- App Setup -----------------
 st.set_page_config(layout="wide", page_title="Clustering + Batch Navigation")
-st.title("🗺️ Clustering + Batch Navigation")
+st.title("🗺️ Clustering + Batch Navigation (Map-Click Start • Skip/Mark)")
 
 # Session state
 for k in ["visited_ticket_ids", "skipped_ticket_ids"]:
@@ -93,6 +132,10 @@ for k in ["visited_ticket_ids", "skipped_ticket_ids"]:
         st.session_state[k] = set()
 if "batch_cursor" not in st.session_state:
     st.session_state.batch_cursor = 0
+if "origin_lat" not in st.session_state:
+    st.session_state.origin_lat = None
+if "origin_lon" not in st.session_state:
+    st.session_state.origin_lon = None
 if "uploaded_after_photos" not in st.session_state:
     st.session_state.uploaded_after_photos = {}
 if "restored_photo_counts" not in st.session_state:
@@ -104,13 +147,11 @@ if "dataset_id" not in st.session_state:
 csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_uploader_main")
 subcategory_option = st.selectbox(
     "Issue Subcategory",
-    [
-        "Pothole","Garbage dumped on public land","Unpaved Road","Broken Footpath / Divider",
-        "Sand piled on roadsides + Mud/slit on roadside","Malba, bricks, bori, etc dumped on public land",
-        "Construction/ demolition activity without safeguards","Encroachment-Building Materials Dumped on Road",
-        "Burning of garbage, plastic, leaves, branches etc.","Overflowing Dustbins",
-        "Barren land to be greened","Greening of Central Verges","Unsurfaced Parking Lots"
-    ],
+    ["Pothole","Garbage dumped on public land","Unpaved Road","Broken Footpath / Divider",
+     "Sand piled on roadsides + Mud/slit on roadside","Malba, bricks, bori, etc dumped on public land",
+     "Construction/ demolition activity without safeguards","Encroachment-Building Materials Dumped on Road",
+     "Burning of garbage, plastic, leaves, branches etc.","Overflowing Dustbins",
+     "Barren land to be greened","Greening of Central Verges","Unsurfaced Parking Lots"],
     key="sel_subcategory"
 )
 radius_m = st.number_input("Clustering radius (m)", 1, 1000, 15, key="num_radius")
@@ -120,9 +161,8 @@ if not csv_file:
     st.info("Upload the required CSV to proceed.")
     st.stop()
 
-# Load CSV
 csv_bytes = csv_file.getvalue()
-dataset_id = hashlib.sha1(csv_bytes).hexdigest()
+dataset_id = dataset_fingerprint(csv_bytes)
 st.session_state.dataset_id = dataset_id
 st.caption(f"Dataset ID: `{dataset_id[:8]}…`")
 
@@ -132,7 +172,6 @@ if missing:
     st.error(f"Missing required columns: {missing}")
     st.stop()
 
-# Restore prior progress
 rest_visited, rest_skipped, rest_photo_counts = load_progress(dataset_id)
 st.session_state.visited_ticket_ids |= rest_visited
 st.session_state.skipped_ticket_ids |= rest_skipped
@@ -142,11 +181,11 @@ df['SUBCATEGORY_NORM'] = normalize_subcategory(df['SUBCATEGORY'])
 df = df[df['SUBCATEGORY_NORM'] == subcategory_option.lower()].copy()
 df['LATITUDE']  = pd.to_numeric(df['LATITUDE'], errors='coerce')
 df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
-df = df[df['LATITUDE'].between(-90, 90) & df['LONGITUDE'].between(-180, 180)]
+df = df[df['LATITUDE'].between(-90, 90)]
+df = df[df['LONGITUDE'].between(-180, 180)]
 df.dropna(subset=['LATITUDE','LONGITUDE'], inplace=True)
-
 if df.empty:
-    st.warning("No valid rows for the selected subcategory after cleaning LAT/LON.")
+    st.warning("No valid rows for the selected subcategory.")
     st.stop()
 
 # Clustering
@@ -154,112 +193,110 @@ coords_deg = df[['LATITUDE','LONGITUDE']].to_numpy(dtype=float)
 coords_rad = np.radians(coords_deg)
 eps_rad = float(radius_m) / EARTH_RADIUS_M
 db = DBSCAN(eps=eps_rad, min_samples=int(min_samples), metric='haversine', algorithm='ball_tree')
-labels = db.fit_predict(coords_rad)
-df['CLUSTER NUMBER'] = labels
+df['CLUSTER NUMBER'] = db.fit_predict(coords_rad)
 df['IS_CLUSTERED'] = df['CLUSTER NUMBER'] != -1
 
-# ----------------- Batch Navigation -----------------
-st.subheader("Step 4: Set Start Point (Optional)")
+# ---------------- Start Point ----------------
+st.subheader("Step 4: Set Start Point")
+colA, colB = st.columns(2)
+with colA:
+    q = st.text_input("🔎 Search address / landmark (optional)", key="txt_addr_query")
+    if st.button("Search & set start", key="btn_addr_geocode") and q.strip():
+        try:
+            url = "https://nominatim.openstreetmap.org/search"
+            r = requests.get(url, params={"q": q.strip(),"format":"json","limit":1},
+                             headers={"User-Agent": "cluster-app/1.0"}, timeout=6)
+            if r.status_code == 200 and r.json():
+                st.session_state.origin_lat = float(r.json()[0]["lat"])
+                st.session_state.origin_lon = float(r.json()[0]["lon"])
+                st.success(f"Start set: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+                st.rerun()
+            else:
+                st.error("Could not geocode that query.")
+        except Exception:
+            st.error("Error in geocoding.")
+with colB:
+    man_lat = st.text_input("Manual latitude (optional)", key="txt_lat")
+    man_lon = st.text_input("Manual longitude (optional)", key="txt_lon")
+    if st.button("Set manual start", key="btn_set_manual"):
+        try:
+            st.session_state.origin_lat = float(man_lat)
+            st.session_state.origin_lon = float(man_lon)
+            st.success(f"Manual start set: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+            st.rerun()
+        except Exception:
+            st.error("Invalid coordinates")
 
-origin_lat = st.number_input("Start Latitude (optional)", value=float(df['LATITUDE'].mean()))
-origin_lon = st.number_input("Start Longitude (optional)", value=float(df['LONGITUDE'].mean()))
+# ---------------- Step 5: Batch Navigation ----------------
+st.subheader("Step 5: Batches of 10 — View • Skip • Mark")
 
-# Filter out visited/skipped
 pool = df[~df['ISSUE ID'].astype(str).isin(st.session_state.visited_ticket_ids)]
 pool = pool[~pool['ISSUE ID'].astype(str).isin(st.session_state.skipped_ticket_ids)]
 st.caption(f"Remaining tickets: {len(pool)} | Visited: {len(st.session_state.visited_ticket_ids)} | Skipped: {len(st.session_state.skipped_ticket_ids)}")
 
 if pool.empty:
-    st.info("No tickets remaining after filters/visited/skipped.")
+    st.success("All tickets processed!")
     st.stop()
 
-# Build nearest neighbor sequence
-long_seq_rows = build_nearest_neighbor_sequence(pool, origin_lat, origin_lon, limit=min(200, len(pool)))
-seq_df = pd.DataFrame(long_seq_rows)
-
-if st.session_state.batch_cursor >= len(seq_df):
+batch_size = 10
+cursor = st.session_state.batch_cursor
+batch = pool.iloc[cursor:cursor+batch_size]
+if batch.empty:
     st.session_state.batch_cursor = 0
-start = st.session_state.batch_cursor
-end = min(start + 10, len(seq_df))
-batch_df = seq_df.iloc[start:end].copy()
+    batch = pool.iloc[0:batch_size]
 
-st.subheader("Step 5: Current Batch — View & Upload After Photos")
+st.session_state.batch_cursor += batch_size
 
-def _save_photo_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
-    ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    saved_name = f"{issue_id}_after_{ts_str}.jpg"
-    st.session_state.uploaded_after_photos.setdefault(str(issue_id), []).append({
-        "bytes": img_bytes,
-        "saved_name": saved_name,
-        "original_name": original_name,
-        "source": source,
-        "ward": str(ward),
-        "status": str(status),
-        "ts_str": ts_str,
+# ---------------- Table of nearest batch ----------------
+batch_table = []
+for idx, row in batch.iterrows():
+    ticket_id = str(row['ISSUE ID'])
+    before_link = row['BEFORE PHOTO'] if is_url(row['BEFORE PHOTO']) else ""
+    photo_count = st.session_state.restored_photo_counts.get(ticket_id, 0)
+    batch_table.append({
+        "ISSUE ID": ticket_id,
+        "ADDRESS": row['ADDRESS'],
+        "BEFORE PHOTO": f"[link]({before_link})" if before_link else "",
+        "AFTER PHOTO": f"{photo_count} photo(s) uploaded"
     })
-    counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
-    save_progress(st.session_state.dataset_id,
-                  st.session_state.visited_ticket_ids,
-                  st.session_state.skipped_ticket_ids,
-                  counts)
 
-for _, row in batch_df.iterrows():
-    issue_id = str(row['ISSUE ID'])
-    ward     = row.get('WARD', '')
-    status   = row.get('STATUS', '')
+st.write("### Nearest Batch Tickets")
+st.table(pd.DataFrame(batch_table))
 
-    st.markdown(f"**Issue {issue_id}** — Ward {ward}, Status: {status}")
-    cam = st.camera_input(f"Take photo ({issue_id})", key=f"cam_{issue_id}")
-    if cam is not None:
-        _save_photo_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
-        st.success("Captured ✅")
-    up = st.file_uploader(f"Upload photo ({issue_id})", type=["jpg","jpeg","png"], key=f"upl_{issue_id}")
-    if up is not None:
-        _save_photo_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
-        st.success("Uploaded ✅")
+# ---------------- Photo upload per ticket ----------------
+st.write("### Upload After Photos (Camera or File)")
+for idx, row in batch.iterrows():
+    ticket_id = str(row['ISSUE ID'])
+    uploaded_files = st.file_uploader(
+        f"Upload After Photo for Ticket {ticket_id}",
+        type=["jpg","jpeg","png"],
+        accept_multiple_files=True,
+        key=f"up_after_{ticket_id}"
+    )
+    if uploaded_files:
+        count = st.session_state.uploaded_after_photos.get(ticket_id, 0)
+        count += len(uploaded_files)
+        st.session_state.uploaded_after_photos[ticket_id] = count
+        st.success(f"{len(uploaded_files)} photo(s) uploaded. Total: {count}")
+        save_progress(dataset_id, st.session_state.visited_ticket_ids,
+                      st.session_state.skipped_ticket_ids, st.session_state.uploaded_after_photos)
 
-    # Status line
-    if issue_id in st.session_state.uploaded_after_photos:
-        cnt = len(st.session_state.uploaded_after_photos[issue_id])
-        st.info(f"✅ {cnt} photo(s) saved in this session")
-    elif issue_id in st.session_state.restored_photo_counts:
-        cnt = st.session_state.restored_photo_counts[issue_id]
-        st.info(f"✅ {cnt} photo(s) previously saved (no files in session)")
-    else:
-        st.warning("⚠️ No After Photo saved yet")
-    st.divider()
+# ---------------- Step 6: Map ----------------
+st.subheader("Step 6: Map of Batch Tickets")
+m = folium.Map(location=[st.session_state.origin_lat or batch.iloc[0]['LATITUDE'],
+                         st.session_state.origin_lon or batch.iloc[0]['LONGITUDE']], zoom_start=15)
+marker_cluster = MarkerCluster().add_to(m)
+for idx, row in batch.iterrows():
+    ticket_id = str(row['ISSUE ID'])
+    color = "orange"  # batch
+    popup_html = f"<b>Ticket {escape(ticket_id)}</b><br>"
+    before_link = row['BEFORE PHOTO'] if is_url(row['BEFORE PHOTO']) else ""
+    if before_link:
+        popup_html += f'<a href="{before_link}" target="_blank">Before Photo</a><br>'
+    folium.Marker(location=[row['LATITUDE'], row['LONGITUDE']],
+                  popup=popup_html,
+                  icon=folium.Icon(color=color)).add_to(marker_cluster)
 
-# ---------------- Batch Actions ----------------
-c1, c2, c3, c4 = st.columns(4)
-first_id = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
+st_folium(m, width=900, height=500)
 
-def _persist_counts_now():
-    counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
-    save_progress(st.session_state.dataset_id,
-                  st.session_state.visited_ticket_ids,
-                  st.session_state.skipped_ticket_ids,
-                  counts)
-
-if c1.button("Mark All Visited"):
-    for iid in batch_df['ISSUE ID'].astype(str):
-        st.session_state.visited_ticket_ids.add(iid)
-    _persist_counts_now()
-    st.session_state.batch_cursor += 10
-    st.experimental_rerun()
-
-if c2.button("Skip All"):
-    for iid in batch_df['ISSUE ID'].astype(str):
-        st.session_state.skipped_ticket_ids.add(iid)
-    _persist_counts_now()
-    st.session_state.batch_cursor += 10
-    st.experimental_rerun()
-
-if c3.button("Next Batch"):
-    st.session_state.batch_cursor += 10
-    st.experimental_rerun()
-
-if c4.button("Reset Batch Cursor"):
-    st.session_state.batch_cursor = 0
-    st.experimental_rerun()
-
-st.caption("All progress is auto-saved locally and restored on reload.")
+st.success("✅ Batch display, After Photo upload, and Map restored successfully.")

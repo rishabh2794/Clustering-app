@@ -1,8 +1,3 @@
-streamlit
-pandas
-numpy
-scikit-learn
-folium
-openpyxl
-streamlit-folium
-requests
+libproj-dev
+proj-bin
+libspatialite-dev

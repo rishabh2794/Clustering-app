@@ -6,3 +6,4 @@ folium
 openpyxl
 streamlit-folium
 requests
+# no geopandas, no fiona

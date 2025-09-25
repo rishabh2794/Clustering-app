@@ -1,1 +1,1 @@
-remove packages.txt
+gdal-bin libgdal-dev proj-bin libkml-dev

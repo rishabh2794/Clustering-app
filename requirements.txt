@@ -8,5 +8,5 @@ shapely
 openpyxl
 fiona
 requests
-streamlit-geolocation
 streamlit-folium
+streamlit-geolocation

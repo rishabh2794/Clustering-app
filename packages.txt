@@ -1,1 +1,5 @@
-gdal-bin libgdal-dev proj-bin libkml-dev
+gdal-bin
+libgdal-dev
+libproj-dev
+proj-bin
+libspatialite-dev

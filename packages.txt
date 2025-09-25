@@ -1,4 +1,8 @@
-gdal-bin
-libproj-dev
-proj-bin
-libspatialite-dev
+streamlit
+pandas
+numpy
+scikit-learn
+folium
+openpyxl
+streamlit-folium
+requests

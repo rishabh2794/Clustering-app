@@ -1,7 +1,7 @@
 # app.py — Clustering + Batch Navigation + Skip/Mark + Clickable Image Popups
-# with Map-Click Start & Address Search (no GPS/IP needed)
 # ----------------------------------------------------------------------------
-# Added: JSON persistence for visited/skipped + photo counts (no photos saved to disk!)
+# JSON persistence for visited/skipped + photo counts
+# Photos remain session-only (in memory); use ZIP download to keep them
 
 import math
 import io
@@ -9,13 +9,12 @@ import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
-import tempfile
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional heavy deps
+# Optional GeoPandas (not mandatory now since maps removed)
 try:
     import geopandas as gpd
     HAVE_GPD = True
@@ -23,9 +22,6 @@ except Exception:
     HAVE_GPD = False
 
 from sklearn.cluster import DBSCAN
-from openpyxl import load_workbook
-from streamlit_folium import st_folium
-from html import escape
 
 # ----------------- JSON Progress Persistence -----------------
 PROGRESS_ROOT = Path("./progress")
@@ -93,12 +89,26 @@ def google_maps_url(origin_lat, origin_lon, dest_lat, dest_lon, mode="driving", 
         parts.append(f"waypoints={quote(wp, safe='|,')}")
     return base + "&" + "&".join(parts)
 
+def build_nearest_neighbor_sequence(df_like: pd.DataFrame, start_lat: float, start_lon: float, limit: int):
+    seq = []
+    pool = df_like.copy()
+    if pool.empty:
+        return seq
+    cur_lat, cur_lon = float(start_lat), float(start_lon)
+    for _ in range(min(limit, len(pool))):
+        pool['__dist'] = pool.apply(lambda r: haversine_m(cur_lat, cur_lon, r['LATITUDE'], r['LONGITUDE']), axis=1)
+        nxt = pool.sort_values('__dist').iloc[0]
+        seq.append(nxt)
+        cur_lat, cur_lon = float(nxt['LATITUDE']), float(nxt['LONGITUDE'])
+        pool = pool[pool['ISSUE ID'] != nxt['ISSUE ID']]
+    return seq
+
 def is_url(u):
     return isinstance(u, str) and u.startswith(("http://", "https://"))
 
 # ----------------- App Setup -----------------
 st.set_page_config(layout="wide", page_title="Clustering + Batch Navigation")
-st.title("🗺️ Clustering + Batch Navigation (Map-Click Start • Skip/Mark • Downloads)")
+st.title("🗺️ Clustering + Batch Navigation (Skip/Mark • Downloads)")
 
 # Session state
 for k in ["visited_ticket_ids", "skipped_ticket_ids"]:
@@ -160,10 +170,10 @@ df = df[df['SUBCATEGORY_NORM'] == subcategory_option.lower()].copy()
 
 df['LATITUDE']  = pd.to_numeric(df['LATITUDE'], errors='coerce')
 df['LONGITUDE'] = pd.to_numeric(df['LONGITUDE'], errors='coerce')
-df.dropna(subset=['LATITUDE','LONGITUDE'], inplace=True)
+df = df.dropna(subset=['LATITUDE','LONGITUDE'])
 
 if df.empty:
-    st.warning("No valid rows for the selected subcategory after cleaning LAT/LON.")
+    st.warning("No valid rows for the selected subcategory.")
     st.stop()
 
 coords_deg = df[['LATITUDE','LONGITUDE']].to_numpy(dtype=float)
@@ -179,25 +189,39 @@ gdf_all = df.copy()
 # ---------------- Start Point ----------------
 st.subheader("Step 4: Set Start Point")
 
-center_lat = float(df['LATITUDE'].mean())
-center_lon = float(df['LONGITUDE'].mean())
-mini = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+colA, colB = st.columns(2)
+with colA:
+    q = st.text_input("🔎 Search address / landmark (optional)", key="txt_addr_query")
+    if st.button("Search & set start", key="btn_addr_geocode"):
+        try:
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {"q": q, "format": "json", "limit": 1}
+            headers = {"User-Agent": "cluster-app/1.0"}
+            r = requests.get(url, params=params, headers=headers, timeout=6)
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    g_lat, g_lon = float(data[0]["lat"]), float(data[0]["lon"])
+                    st.session_state.origin_lat = g_lat
+                    st.session_state.origin_lon = g_lon
+                    st.success(f"Start set from search: {g_lat:.6f}, {g_lon:.6f}")
+                    st.rerun()
+                else:
+                    st.error("No results found. Try again.")
+        except Exception:
+            st.error("Geocoding request failed. Try again later.")
 
-if st.session_state.origin_lat is not None and st.session_state.origin_lon is not None:
-    folium.Marker(
-        [st.session_state.origin_lat, st.session_state.origin_lon],
-        popup="Start here",
-        icon=folium.Icon(color="green", icon="flag")
-    ).add_to(mini)
-
-click_state = st_folium(mini, height=320, width=None, key="mini_click", returned_objects=["last_clicked"])
-if isinstance(click_state, dict):
-    clicked = click_state.get("last_clicked")
-    if clicked and "lat" in clicked and "lng" in clicked:
-        st.session_state.origin_lat = float(clicked["lat"])
-        st.session_state.origin_lon = float(clicked["lng"])
-        st.success(f"Start set from map click: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
-        st.rerun()
+with colB:
+    man_lat = st.text_input("Manual latitude (optional)", key="txt_lat")
+    man_lon = st.text_input("Manual longitude (optional)", key="txt_lon")
+    if st.button("Set manual start", key="btn_set_manual"):
+        try:
+            st.session_state.origin_lat = float(man_lat)
+            st.session_state.origin_lon = float(man_lon)
+            st.success(f"Manual start set: {st.session_state.origin_lat:.6f}, {st.session_state.origin_lon:.6f}")
+            st.rerun()
+        except Exception:
+            st.error("Invalid coordinates. Example: 26.8467, 80.9462")
 
 origin_lat = st.session_state.origin_lat
 origin_lon = st.session_state.origin_lon
@@ -219,40 +243,152 @@ if pool.empty:
     st.info("No tickets remaining.")
     batch_df = pd.DataFrame(columns=['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO'])
 else:
-    batch_df = pool.head(10)
+    if origin_lat is None or origin_lon is None:
+        seed_lat, seed_lon = float(pool['LATITUDE'].mean()), float(pool['LONGITUDE'].mean())
+    else:
+        seed_lat, seed_lon = origin_lat, origin_lon
+
+    long_seq_rows = build_nearest_neighbor_sequence(pool, seed_lat, seed_lon, limit=min(200, len(pool)))
+    seq_df = pd.DataFrame(long_seq_rows)
+
+    if st.session_state.batch_cursor >= len(seq_df):
+        st.session_state.batch_cursor = 0
+
+    start = st.session_state.batch_cursor
+    end = min(start + 10, len(seq_df))
+    batch_df = seq_df.iloc[start:end].copy()
+
+    if batch_df.empty and not seq_df.empty:
+        st.session_state.batch_cursor = 0
+        start, end = 0, min(10, len(seq_df))
+        batch_df = seq_df.iloc[start:end].copy()
+
+    batch_df_display = batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']].reset_index(drop=True)
+    batch_df_display.index = batch_df_display.index + 1
+
+    def as_link_or_none(x):
+        s = str(x or "").strip()
+        return s if is_url(s) else None
+    batch_df_display['BEFORE PHOTO'] = batch_df_display['BEFORE PHOTO'].apply(as_link_or_none)
 
     st.dataframe(
-        batch_df[['ISSUE ID','WARD','STATUS','LATITUDE','LONGITUDE','BEFORE PHOTO']].reset_index(drop=True),
-        use_container_width=True
+        batch_df_display,
+        use_container_width=True,
+        column_config={
+            'LATITUDE': st.column_config.NumberColumn('LATITUDE', format="%.6f"),
+            'LONGITUDE': st.column_config.NumberColumn('LONGITUDE', format="%.6f"),
+            'BEFORE PHOTO': st.column_config.LinkColumn('Before Photo', display_text='Open'),
+        }
     )
 
+    # After Photo uploads
+    st.markdown("### After Photo uploads for current batch")
+    from datetime import datetime
+    def _save_photo_bytes(img_bytes: bytes, issue_id: str, ward: str, status: str, original_name: str, source: str):
+        ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        saved_name = f"{issue_id}_after_{ts_str}.jpg"
+        st.session_state.uploaded_after_photos.setdefault(str(issue_id), []).append({
+            "bytes": img_bytes,
+            "saved_name": saved_name,
+            "original_name": original_name,
+            "source": source,
+            "ward": str(ward),
+            "status": str(status),
+            "ts_str": ts_str,
+        })
+        counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
+        save_progress(st.session_state.dataset_id,
+                      st.session_state.visited_ticket_ids,
+                      st.session_state.skipped_ticket_ids,
+                      counts)
+
+    for _, row in batch_df.iterrows():
+        issue_id = str(row['ISSUE ID'])
+        ward     = row.get('WARD', '')
+        status   = row.get('STATUS', '')
+
+        st.markdown(f"**Issue {issue_id}** — Ward {ward}, Status: {status}")
+        cam = st.camera_input(f"Take photo ({issue_id})", key=f"cam_{issue_id}")
+        if cam is not None:
+            _save_photo_bytes(cam.getvalue(), issue_id, ward, status, original_name="camera.jpg", source="camera")
+            st.success("Captured ✅")
+
+        up = st.file_uploader(
+            f"Upload photo ({issue_id})",
+            type=["jpg","jpeg","png"],
+            key=f"upl_{issue_id}"
+        )
+        if up is not None:
+            _save_photo_bytes(up.read(), issue_id, ward, status, original_name=up.name, source="upload")
+            st.success("Uploaded ✅")
+
+        if issue_id in st.session_state.uploaded_after_photos:
+            cnt = len(st.session_state.uploaded_after_photos[issue_id])
+            st.info(f"✅ {cnt} photo(s) saved in this session")
+        elif issue_id in st.session_state.restored_photo_counts:
+            cnt = st.session_state.restored_photo_counts[issue_id]
+            st.info(f"✅ {cnt} photo(s) previously saved (no files in session)")
+        else:
+            st.warning("⚠️ No After Photo saved yet")
+
+        st.divider()
+
+    # ZIP download
+    st.subheader("Download all clicked/uploaded After Photos")
+    import zipfile, csv
+    if st.session_state.uploaded_after_photos:
+        rows = []
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for issue_id, items in st.session_state.uploaded_after_photos.items():
+                for it in items:
+                    rel_path = f"after_photos/{issue_id}/{it['saved_name']}"
+                    zf.writestr(rel_path, it["bytes"])
+                    rows.append([
+                        issue_id,
+                        it.get("ward",""),
+                        it.get("status",""),
+                        rel_path,
+                        it.get("original_name",""),
+                        it.get("source",""),
+                        it.get("ts_str",""),
+                    ])
+            csv_io = io.StringIO()
+            writer = csv.writer(csv_io)
+            writer.writerow(["ISSUE_ID","WARD","STATUS","SAVED_FILENAME","ORIGINAL_NAME","SOURCE","TIMESTAMP"])
+            writer.writerows(rows)
+            zf.writestr("after_photos_manifest.csv", csv_io.getvalue())
+
+        zip_buf.seek(0)
+        zip_name = datetime.now().strftime("after_photos_%Y-%m-%d_%H%M.zip")
+        st.download_button(
+            "⬇️ Download All After Photos (ZIP + manifest)",
+            data=zip_buf,
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True,
+        )
+    else:
+        st.info("No After Photos captured/uploaded in this session yet.")
+
     # Google Maps link
-    waypoints = [(float(r['LATITUDE']), float(r['LONGITUDE'])) for _, r in batch_df.iterrows()]
-    if waypoints:
+    if not batch_df.empty:
+        waypoints = [(float(r['LATITUDE']), float(r['LONGITUDE'])) for _, r in batch_df.iterrows()]
         last = waypoints[-1]
         mids = waypoints[:-1] if len(waypoints) > 1 else []
         nav_url = google_maps_url(origin_lat, origin_lon, last[0], last[1], waypoints=mids)
         st.markdown(f"[🧭 Open route in Google Maps for this batch]({nav_url})")
 
+    # Actions
     c1, c2, c3, c4 = st.columns(4)
     first_id = str(batch_df.iloc[0]['ISSUE ID']) if not batch_df.empty else None
 
+    def _persist_counts_now():
+        counts = {iid: len(items) for iid, items in st.session_state.uploaded_after_photos.items()}
+        save_progress(st.session_state.dataset_id,
+                      st.session_state.visited_ticket_ids,
+                      st.session_state.skipped_ticket_ids,
+                      counts)
+
     with c1:
-        if st.button("✅ Mark first as Visited"):
-            if first_id:
-                st.session_state.visited_ticket_ids.add(first_id)
-                st.rerun()
-    with c2:
-        if st.button("⏭️ Skip first"):
-            if first_id:
-                st.session_state.skipped_ticket_ids.add(first_id)
-                st.rerun()
-    with c3:
-        if st.button("✅ Mark entire batch as Visited"):
-            for _id in batch_df['ISSUE ID'].astype(str).tolist():
-                st.session_state.visited_ticket_ids.add(_id)
-            st.rerun()
-    with c4:
-        if st.button("➡️ Next batch"):
-            st.session_state.batch_cursor = 0
-            st.rerun()
+        if st.button("✅ Mark first as Visited", key="btn
